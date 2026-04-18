@@ -55,6 +55,10 @@ def main():
     if session.get("skip_permissions") and not no_skip:
         cmd_parts.append("--dangerously-skip-permissions")
 
+    model = (session.get("model") or "").strip()
+    if model:
+        cmd_parts.extend(["--model", model])
+
     if not no_remote:
         cmd_parts.extend(["--remote-control", f'"{session["name"]}"'])
 

@@ -33,6 +33,17 @@ BACKUP_DIR = SCRIPT_DIR / "session_backups"
 BACKUP_INDEX = BACKUP_DIR / "index.json"
 MAX_BACKUPS_PER_SESSION = 10
 
+# (Display label, model id passed to `claude --model`). "" = no flag (use Claude Code default).
+MODEL_CHOICES = [
+    ("Default (Claude Code chooses)", ""),
+    ("Opus 4.7",    "claude-opus-4-7"),
+    ("Opus 4.6",    "claude-opus-4-6"),
+    ("Sonnet 4.6",  "claude-sonnet-4-6"),
+    ("Haiku 4.5",   "claude-haiku-4-5-20251001"),
+]
+MODEL_LABEL_BY_ID = {mid: label for label, mid in MODEL_CHOICES}
+MODEL_ID_BY_LABEL = {label: mid for label, mid in MODEL_CHOICES}
+
 # --- Notepad++ Dark Theme Palette ---
 C = {
     "bg":           "#1e1e1e",
@@ -602,7 +613,7 @@ class SessionManagerApp:
         tree_frame = tk.Frame(paned, bg=C["bg"])
         tree_frame.pack(side="left", fill="both", expand=True)
 
-        columns = ("name", "alias", "directory", "mode", "session_id")
+        columns = ("name", "alias", "directory", "mode", "model", "session_id")
         self.tree = ttk.Treeview(tree_frame, columns=columns, show="headings",
                                   selectmode="browse")
 
@@ -613,13 +624,15 @@ class SessionManagerApp:
         self.tree.heading("directory", text="Working Directory", anchor="w",
                           command=lambda: self._sort_by("cwd"))
         self.tree.heading("mode", text="Mode", anchor="center")
+        self.tree.heading("model", text="Model", anchor="w")
         self.tree.heading("session_id", text="Session ID", anchor="w")
 
         self.tree.column("name", width=220, minwidth=120)
         self.tree.column("alias", width=120, minwidth=70)
-        self.tree.column("directory", width=360, minwidth=180)
-        self.tree.column("mode", width=80, minwidth=60, anchor="center")
-        self.tree.column("session_id", width=280, minwidth=120)
+        self.tree.column("directory", width=300, minwidth=160)
+        self.tree.column("mode", width=70, minwidth=60, anchor="center")
+        self.tree.column("model", width=110, minwidth=80)
+        self.tree.column("session_id", width=240, minwidth=120)
 
         scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=self._on_scroll)
         self.tree.configure(yscrollcommand=self._sync_scroll)
@@ -762,16 +775,21 @@ class SessionManagerApp:
             cwd = s.get("cwd", "")
             mode = "Auto" if s.get("skip_permissions") else "Std"
             sid = s.get("session_id", "")
+            model_id = s.get("model", "")
+            model_label = MODEL_LABEL_BY_ID.get(model_id, model_id) if model_id else "Default"
+            # Compact label for the column
+            model_short = model_label.replace("Default (Claude Code chooses)", "Default")
 
             if filter_text:
                 if (filter_text not in name.lower() and
                     filter_text not in alias.lower() and
                     filter_text not in cwd.lower() and
-                    filter_text not in sid.lower()):
+                    filter_text not in sid.lower() and
+                    filter_text not in model_short.lower()):
                     continue
 
             tag = "odd" if count % 2 == 0 else "even"
-            self.tree.insert("", "end", values=(name, alias, cwd, mode, sid), tags=(tag,))
+            self.tree.insert("", "end", values=(name, alias, cwd, mode, model_short, sid), tags=(tag,))
             count += 1
 
         self.status.set_segment("count", f"{count} sessions")
@@ -858,6 +876,9 @@ class SessionManagerApp:
         cmd_parts = ["claude", "--resume", session_id]
         if skip_perms:
             cmd_parts.append("--dangerously-skip-permissions")
+        model = (session.get("model") or "").strip()
+        if model:
+            cmd_parts.extend(["--model", model])
         if remote:
             # Use single quotes — PowerShell treats as literal string, no escaping issues
             safe_rc_name = name.replace("'", "''")
@@ -1126,12 +1147,25 @@ class SessionDialog(tk.Toplevel):
 
         form.columnconfigure(0, weight=1)
 
+        # Model selector
+        model_row = len(fields) * 2
+        tk.Label(form, text="Model:", bg=C["bg"], fg=C["text"],
+                 font=("Segoe UI", 13)).grid(row=model_row, column=0, sticky="w",
+                                              pady=(14, 0), columnspan=2)
+        current_model_id = (session.get("model", "") if session else "")
+        current_label = MODEL_LABEL_BY_ID.get(current_model_id, MODEL_CHOICES[0][0])
+        self.model_var = tk.StringVar(value=current_label)
+        model_box = ttk.Combobox(form, textvariable=self.model_var,
+                                 values=[lbl for lbl, _ in MODEL_CHOICES],
+                                 state="readonly", font=("Segoe UI", 13))
+        model_box.grid(row=model_row + 1, column=0, sticky="ew", ipady=4, columnspan=2)
+
         # Skip permissions
         self.skip_var = tk.BooleanVar(
             value=session.get("skip_permissions", True) if session else True)
         ttk.Checkbutton(form, text="Skip permission prompts",
                         variable=self.skip_var).grid(
-            row=len(fields) * 2, column=0, sticky="w", pady=(14, 0), columnspan=2)
+            row=model_row + 2, column=0, sticky="w", pady=(14, 0), columnspan=2)
 
         # Buttons
         tk.Frame(self, bg=C["border"], height=1).pack(fill="x", side="bottom", pady=(0, 0))
@@ -1169,6 +1203,7 @@ class SessionDialog(tk.Toplevel):
             "session_id": session_id,
             "cwd": self.entries["cwd"].get().strip() or ".",
             "skip_permissions": self.skip_var.get(),
+            "model": MODEL_ID_BY_LABEL.get(self.model_var.get(), ""),
         }
         self.destroy()
 

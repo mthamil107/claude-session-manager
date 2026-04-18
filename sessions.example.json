@@ -5,14 +5,16 @@
       "alias": "first",
       "session_id": "00000000-0000-0000-0000-000000000000",
       "cwd": "C:\\path\\to\\your\\project",
-      "skip_permissions": true
+      "skip_permissions": true,
+      "model": ""
     },
     {
-      "name": "Backend API",
+      "name": "Backend API (forces Opus 4.7)",
       "alias": "api",
       "session_id": "11111111-1111-1111-1111-111111111111",
       "cwd": "/home/user/code/backend",
-      "skip_permissions": false
+      "skip_permissions": false,
+      "model": "claude-opus-4-7"
     }
   ]
 }
