@@ -1,30 +1,69 @@
 # Claude Session Manager (CSM)
 
-A desktop GUI for managing, launching, and **automatically backing up** your [Claude Code](https://claude.com/claude-code) sessions on Windows.
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
+[![Platform: Windows](https://img.shields.io/badge/platform-Windows-lightgrey.svg)](#requirements)
+[![Status: stable](https://img.shields.io/badge/status-stable-brightgreen.svg)](#)
 
-If you've ever lost a Claude Code conversation because the `.jsonl` file got cleaned up, this tool exists for you.
+> A desktop GUI for managing, launching, and **automatically backing up** your [Claude Code](https://claude.com/claude-code) sessions.
+> If you've ever lost a Claude Code conversation because the `.jsonl` file got cleaned up — this tool exists for you.
+
+<p align="center"><i>Pure Python, no dependencies, ~270 MB of conversations safely backed up on first launch.</i></p>
+
+---
+
+## Table of contents
+
+- [Features](#features)
+- [Why this exists](#why-this-exists)
+- [Quick start](#quick-start)
+- [Requirements](#requirements)
+- [Install](#install)
+- [Usage](#usage)
+- [Keyboard shortcuts](#keyboard-shortcuts)
+- [How backups work](#how-backups-work)
+- [Recovering a deleted session](#recovering-a-deleted-session)
+- [Troubleshooting](#troubleshooting)
+- [File layout](#file-layout)
+- [Contributing](#contributing)
+- [License](#license)
+
+---
 
 ## Features
 
 - **Browse all your Claude sessions** in a Notepad++-style dark UI
-- **Launch any session in a new Windows Terminal tab** with the session name as the tab title
+- **Launch sessions in Windows Terminal tabs** with the session name as the tab title
 - **Automatic backups** of every conversation `.jsonl` file on app startup
-- **Versioned snapshots** — keeps the last 10 backups per session, prunes older ones
-- **One-click restore** of any historical backup
-- **Scan & import** existing sessions from `~/.claude/projects/` (reads the real working directory from inside each `.jsonl`)
-- **CLI launcher** included (`csm_cli.py`) for keyboard-driven workflows
-- Sessions live in a simple JSON file — easy to edit, version, or sync separately
+- **Versioned snapshots** — keeps the last 10 backups per session, auto-prunes older ones
+- **One-click restore** of any historical backup, with a `.pre-restore-*` safety copy
+- **Scan & import** existing sessions — reads the real working directory from inside each `.jsonl`
+- **CLI launcher** (`csm_cli.py`) for keyboard-driven workflows
+- **Zero dependencies** — pure Python standard library (`tkinter`, `json`, `subprocess`, `pathlib`)
+- **Single-file storage** — `sessions.json` is plain JSON, easy to edit, version, or sync
 
 ## Why this exists
 
-Claude Code stores each conversation as a `.jsonl` file in `~/.claude/projects/<encoded-project>/<session-id>.jsonl`. These files can be deleted, lost, or rotated out — and there's no built-in backup. Lose the file, lose the conversation. CSM solves that.
+Claude Code stores each conversation as a `.jsonl` file in `~/.claude/projects/<encoded-project>/<session-id>.jsonl`. Those files can be deleted, lost, or rotated out of existence — and **there is no built-in backup**. Lose the file, lose the conversation. CSM solves that, while also giving you a fast way to launch any session by name.
+
+## Quick start
+
+```bash
+git clone https://github.com/mthamil107/claude-session-manager.git
+cd claude-session-manager
+copy sessions.example.json sessions.json    # Windows
+# cp sessions.example.json sessions.json    # macOS/Linux
+pythonw csm.pyw
+```
+
+Click **Scan** in the toolbar to discover and import your existing Claude sessions, then **Launch** any of them.
 
 ## Requirements
 
-- Windows 10 / 11
-- Python 3.8+ (uses only standard library — `tkinter`, `json`, `subprocess`, `pathlib`)
-- [Claude Code CLI](https://docs.claude.com/en/docs/claude-code) installed and on `PATH`
-- (Optional) [Windows Terminal](https://aka.ms/terminal) for the best launch experience
+- **Windows 10 / 11** (launch path uses Windows Terminal + PowerShell — see [Contributing](#contributing) for cross-platform help)
+- **Python 3.8+** with Tk (default on Windows installs from python.org)
+- **[Claude Code CLI](https://docs.claude.com/en/docs/claude-code)** installed and on `PATH`
+- *(Optional)* **[Windows Terminal](https://aka.ms/terminal)** — for tabbed sessions with proper titles
 
 ## Install
 
@@ -35,10 +74,10 @@ copy sessions.example.json sessions.json
 ```
 
 Then either:
-- Double-click `launch-csm.bat`, or
-- Run `pythonw csm.pyw` from a terminal
 
-### Optional: desktop shortcut
+- Double-click `launch-csm.bat`
+- Run `pythonw csm.pyw` from any terminal
+- *(Optional)* create a desktop shortcut:
 
 ```powershell
 $WshShell = New-Object -ComObject WScript.Shell
@@ -52,29 +91,42 @@ $Shortcut.Save()
 ## Usage
 
 ### Add sessions
-1. Click **Scan** in the toolbar — CSM finds every `.jsonl` in `~/.claude/projects/`
-2. Pick which ones to import — names are auto-extracted from the first user message in each conversation
+
+1. Click **Scan** — CSM finds every `.jsonl` in `~/.claude/projects/`
+2. Pick which to import — names auto-extracted from the first user message in each conversation
 3. Imported sessions appear in the main list
 
-Or click **New** and enter a session ID manually.
+Or click **New** to enter a session ID manually.
 
 ### Launch
-- Select a row → **Launch** (or double-click) — opens a new tab in Windows Terminal with the session name as title
-- **Launch All** — opens every saved session at once (useful for restoring a workspace)
+
+- Select a row → **Launch** (or double-click) — opens a new tab in Windows Terminal with the session name as the title
+- **Launch All** — opens every saved session at once (great for restoring an end-of-day workspace)
 
 ### Backup
-- **Auto-backup** runs on every CSM startup — silent, only copies files that have changed since the last backup (by size + modification time)
+
+- **Auto-backup** runs silently on every CSM startup — only copies files that changed since the last backup (size + mtime fingerprint), so it's fast
 - **Backup** button — manual snapshot anytime
-- Backups live in `./session_backups/<project>/<session-id>/<timestamp>.jsonl`
-- Up to 10 versions kept per session — older snapshots auto-pruned
+- Backups live in `./session_backups/<project>/<session-id>/<YYYY-MM-DD_HHMMSS>.jsonl`
+- Up to **10 snapshots per session** are kept; older ones are auto-pruned
 
 ### Restore
-- Select a session → **Restore**
-- Pick which snapshot to restore from (newest first, with size + timestamp)
-- The current `.jsonl` (if any) is preserved as `.pre-restore-<timestamp>` before being overwritten
-- Companion folder is created automatically (Claude Code requires both `<id>.jsonl` and `<id>/` to exist)
 
-### Keyboard shortcuts
+- Select a session → **Restore**
+- Pick a snapshot from the list (newest first, with size + timestamp)
+- The current `.jsonl` (if any) is preserved as `.pre-restore-<timestamp>` before being overwritten
+- The companion folder Claude Code expects (`<id>/` next to `<id>.jsonl`) is created automatically
+
+### CLI quick launch
+
+```bash
+python csm_cli.py <alias>
+python csm_cli.py list          # list all aliases
+python csm_cli.py api           # resume the session aliased "api"
+```
+
+## Keyboard shortcuts
+
 | Shortcut | Action |
 |----------|--------|
 | `Enter` | Launch selected session |
@@ -88,44 +140,89 @@ Or click **New** and enter a session ID manually.
 | `F5` | Reload sessions list |
 | `1` / `2` | Switch tabs |
 
-### CLI quick launch
+## How backups work
 
-```bash
-python csm_cli.py <alias>
-```
+On every startup CSM walks `~/.claude/projects/*/`, inspecting every `.jsonl` file:
 
-For example, `python csm_cli.py api` resumes the session you aliased as `api`.
+1. Compute a fingerprint: `<size>:<mtime>`
+2. Compare it against the last fingerprint in `session_backups/index.json`
+3. If unchanged → skip
+4. If new or changed → copy to `session_backups/<project>/<session-id>/<YYYY-MM-DD_HHMMSS>.jsonl`
+5. If more than 10 snapshots exist for a session → delete the oldest
+
+Only changed files are copied, so backups stay quick and disk usage stays small. If `session_backups/` lives on a different drive from `~/.claude/` you also get cross-drive redundancy for free.
+
+## Recovering a deleted session
+
+If a Claude `.jsonl` was deleted and you have a CSM backup:
+
+1. Open CSM, select the session in the list
+2. Click **Restore** — pick the snapshot you want
+3. CSM copies the `.jsonl` back to `~/.claude/projects/<project>/<session-id>.jsonl` and creates the companion `<session-id>/` folder
+4. From a terminal in the original working directory:
+   ```bash
+   claude --resume <session-id>
+   ```
+
+> **Heads up:** Claude Code requires *both* `<id>.jsonl` and a folder named `<id>/` to exist in the same project directory. CSM creates the folder for you on restore — manual restores need to do this themselves.
+
+If you have **no CSM backup yet** and the file was just deleted, your last hopes are:
+
+1. Windows **Recycle Bin**
+2. **Volume Shadow Copies** (`vssadmin list shadows /for=C:`)
+3. **OneDrive version history** if `~/.claude` happens to be synced
+4. File-recovery tools like Recuva — only useful if disk sectors haven't been overwritten
+
+## Troubleshooting
+
+**Launching a session does nothing / a black window flashes and disappears.**
+The cwd in `sessions.json` probably doesn't exist anymore. Edit the session (`F2`) and fix the **Working Directory** field, or click **Scan** to re-import with the correct path read from the `.jsonl`.
+
+**`claude --resume <id>` says "No conversation found" even after restore.**
+Claude Code requires the companion folder. Make sure both of these exist:
+- `~/.claude/projects/<project>/<session-id>.jsonl`
+- `~/.claude/projects/<project>/<session-id>/`
+
+CSM does this automatically on **Restore**. If you copied a file in by hand, create the folder yourself.
+
+**Tab title shows "Claude Code" instead of the session name.**
+In Windows Terminal: Settings → your PowerShell profile → Advanced → uncheck **Suppress title changes from the application**.
+
+**`pythonw` not found.**
+Use `python` instead, or install Python from [python.org](https://www.python.org/downloads/) (the Microsoft Store build sometimes lacks `pythonw`).
+
+**`tkinter` not installed.**
+Tk ships with the Windows Python installer by default. On Linux: `sudo apt install python3-tk`. On macOS: it's bundled with the python.org build.
 
 ## File layout
 
 ```
 claude-session-manager/
-├── csm.pyw              # main GUI app (run with pythonw)
-├── csm_cli.py           # command-line launcher
-├── launch-csm.bat       # Windows double-click launcher
-├── csm-cli.bat          # CLI launcher
-├── sessions.example.json
-├── sessions.json        # YOUR sessions (gitignored)
-├── session_backups/     # YOUR backups (gitignored)
-└── ...
+├── csm.pyw                  # main GUI app (run with pythonw)
+├── csm_cli.py               # command-line launcher
+├── launch-csm.bat           # Windows double-click launcher
+├── csm-cli.bat              # CLI launcher
+├── sessions.example.json    # template
+├── sessions.json            # YOUR sessions  (gitignored)
+├── session_backups/         # YOUR backups   (gitignored)
+├── README.md
+├── LICENSE
+└── .gitignore
 ```
 
 `sessions.json` and `session_backups/` are gitignored — your data stays local.
 
-## How backups work
-
-On every startup CSM walks `~/.claude/projects/*/` and looks at every `.jsonl` file. For each one it computes a fingerprint (`size:mtime`) and compares it against the last fingerprint stored in `session_backups/index.json`. If the file has changed, it's copied to `session_backups/<project>/<session-id>/<YYYY-MM-DD_HHMMSS>.jsonl`. Only changed files get copied, so backups stay fast and storage stays small.
-
-When you have more than 10 snapshots for a single session, the oldest is deleted.
-
-If `session_backups/` lives on a different drive from `~/.claude/`, you also get cross-drive redundancy.
-
 ## Contributing
 
-PRs welcome. Particularly useful additions:
-- macOS / Linux launch support (currently uses Windows Terminal + PowerShell)
-- Cloud backup destinations (S3, Drive)
-- Session search across all conversation contents
+PRs welcome. Particularly valuable:
+
+- **macOS / Linux launch support** — currently launches via `wt.exe` + PowerShell
+- **Cloud backup destinations** — S3, Google Drive, Dropbox
+- **Full-text search** across all conversation contents
+- **Diff viewer** between backup snapshots
+- **Theme support** — currently dark only
+
+Open an issue first if you want to discuss an approach.
 
 ## License
 
