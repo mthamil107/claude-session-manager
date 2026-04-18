@@ -1,0 +1,18 @@
+{
+  "sessions": [
+    {
+      "name": "My First Project",
+      "alias": "first",
+      "session_id": "00000000-0000-0000-0000-000000000000",
+      "cwd": "C:\\path\\to\\your\\project",
+      "skip_permissions": true
+    },
+    {
+      "name": "Backend API",
+      "alias": "api",
+      "session_id": "11111111-1111-1111-1111-111111111111",
+      "cwd": "/home/user/code/backend",
+      "skip_permissions": false
+    }
+  ]
+}
