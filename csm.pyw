@@ -516,6 +516,7 @@ class SessionManagerApp:
         for text, cmd in [
             ("Launch", self.launch_session),
             ("Launch All", self.launch_all_sessions),
+            ("Run Task", self.run_task),
         ]:
             ToolbarButton(toolbar, text=text, command=cmd).pack(side="left", padx=1)
 
@@ -854,6 +855,16 @@ class SessionManagerApp:
         for s in self.sessions:
             self._do_launch(s, quiet=True)
         self.status.flash(f"Launched {count} sessions", C["accent_green"])
+
+    def run_task(self):
+        """Open the Run Task dialog: spawn `claude -p` in a target session's project."""
+        target = self._get_selected_session()
+        if not target:
+            messagebox.showinfo("Run Task", "Select a target session in the list first.")
+            return
+        RunTaskDialog(self.root, target, self.sessions,
+                      on_done=lambda name: self.status.flash(
+                          f"Task dispatched to '{name}'", C["accent_green"]))
 
     def _do_launch(self, session, quiet=False):
         import shutil
@@ -1417,6 +1428,151 @@ class RestoreDialog(tk.Toplevel):
             self.destroy()
         except Exception as e:
             messagebox.showerror("Restore Failed", str(e))
+
+
+class RunTaskDialog(tk.Toplevel):
+    """Compose a one-shot `claude -p` task to run in a target session's project."""
+
+    def __init__(self, parent, target_session, all_sessions, on_done):
+        super().__init__(parent)
+        self.target = target_session
+        self.all_sessions = all_sessions
+        self.on_done = on_done
+
+        W, H = 760, 620
+        self.title(f"Run Task - {target_session.get('name','')}")
+        self.geometry(f"{W}x{H}")
+        self.minsize(640, 540)
+        self.configure(bg=C["bg"])
+        self.transient(parent)
+        self.grab_set()
+
+        self.update_idletasks()
+        x = parent.winfo_x() + (parent.winfo_width() - W) // 2
+        y = parent.winfo_y() + (parent.winfo_height() - H) // 2
+        self.geometry(f"+{x}+{y}")
+
+        # Header
+        header = tk.Frame(self, bg=C["bg_toolbar"], height=44)
+        header.pack(fill="x")
+        header.pack_propagate(False)
+        tk.Label(header, text=f"  Run Task in: {target_session.get('name','')}",
+                 bg=C["bg_toolbar"], fg=C["text_bright"],
+                 font=("Segoe UI", 14, "bold")).pack(side="left", fill="y")
+        tk.Frame(self, bg=C["border"], height=1).pack(fill="x")
+
+        body = tk.Frame(self, bg=C["bg"])
+        body.pack(fill="both", expand=True, padx=18, pady=12)
+
+        tk.Label(body, text=f"Target cwd:  {target_session.get('cwd','')}",
+                 bg=C["bg"], fg=C["text_dim"], font=("Segoe UI", 11)
+                 ).pack(anchor="w", pady=(0, 8))
+
+        # Prompt
+        tk.Label(body, text="Task prompt:", bg=C["bg"], fg=C["text"],
+                 font=("Segoe UI", 13)).pack(anchor="w")
+        self.prompt_text = tk.Text(body, height=8, bg=C["bg_input"], fg=C["text_bright"],
+                                    insertbackground=C["text_bright"],
+                                    font=("Segoe UI", 13), relief="flat",
+                                    highlightthickness=1, highlightbackground=C["border"],
+                                    highlightcolor=C["accent"], wrap="word")
+        self.prompt_text.pack(fill="both", expand=True, pady=(4, 10))
+
+        # Tools
+        row1 = tk.Frame(body, bg=C["bg"])
+        row1.pack(fill="x", pady=(0, 8))
+        tk.Label(row1, text="Allowed tools:", bg=C["bg"], fg=C["text"],
+                 font=("Segoe UI", 13), width=14, anchor="w").pack(side="left")
+        self.tools_var = tk.StringVar(value="Read,Edit,Bash")
+        tk.Entry(row1, textvariable=self.tools_var, bg=C["bg_input"], fg=C["text_bright"],
+                 insertbackground=C["text_bright"], font=("Segoe UI", 13), relief="flat",
+                 highlightthickness=1, highlightbackground=C["border"],
+                 highlightcolor=C["accent"]).pack(side="left", fill="x", expand=True, ipady=3)
+
+        # Continue checkbox
+        self.continue_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(body, text="Append to target's existing conversation (--continue)",
+                        variable=self.continue_var).pack(anchor="w", pady=(4, 6))
+
+        # Context group
+        ctx_frame = tk.LabelFrame(body, text="Include context from another session (optional)",
+                                   bg=C["bg"], fg=C["text"], font=("Segoe UI", 12),
+                                   bd=1, relief="solid", labelanchor="nw")
+        ctx_frame.pack(fill="x", pady=(8, 6))
+
+        ctx_row = tk.Frame(ctx_frame, bg=C["bg"])
+        ctx_row.pack(fill="x", padx=8, pady=8)
+
+        tk.Label(ctx_row, text="From session:", bg=C["bg"], fg=C["text"],
+                 font=("Segoe UI", 12), width=14, anchor="w").pack(side="left")
+        names = ["(none)"] + [s.get("name", s.get("alias", s.get("session_id", "?")))
+                              for s in all_sessions]
+        self.source_var = tk.StringVar(value="(none)")
+        ttk.Combobox(ctx_row, textvariable=self.source_var, values=names,
+                     state="readonly", font=("Segoe UI", 12), width=32
+                     ).pack(side="left", padx=(0, 12))
+
+        tk.Label(ctx_row, text="Last N turns:", bg=C["bg"], fg=C["text"],
+                 font=("Segoe UI", 12)).pack(side="left", padx=(0, 4))
+        self.turns_var = tk.IntVar(value=20)
+        tk.Spinbox(ctx_row, from_=0, to=200, textvariable=self.turns_var, width=5,
+                   font=("Segoe UI", 12)).pack(side="left")
+
+        # Buttons
+        tk.Frame(self, bg=C["border"], height=1).pack(fill="x", side="bottom")
+        btn_bar = tk.Frame(self, bg=C["bg_lighter"], height=52)
+        btn_bar.pack(fill="x", side="bottom")
+        btn_bar.pack_propagate(False)
+
+        tk.Button(btn_bar, text="Cancel", bg=C["bg_toolbar"], fg=C["text"],
+                  font=("Segoe UI", 13), relief="flat", padx=14, pady=6,
+                  cursor="hand2", command=self.destroy).pack(side="right", padx=8, pady=10)
+
+        tk.Button(btn_bar, text="Run Task", bg=C["accent"], fg=C["text_white"],
+                  font=("Segoe UI", 13, "bold"), relief="flat", padx=14, pady=6,
+                  cursor="hand2", command=self._run).pack(side="right", pady=10)
+
+        self.prompt_text.focus_set()
+
+    def _run(self):
+        prompt = self.prompt_text.get("1.0", "end").strip()
+        if not prompt:
+            messagebox.showwarning("Required", "Please type a task prompt.")
+            return
+
+        # Resolve source session for context (if any)
+        source_session = None
+        sel_name = self.source_var.get()
+        if sel_name and sel_name != "(none)":
+            for s in self.all_sessions:
+                if s.get("name") == sel_name:
+                    source_session = s
+                    break
+
+        n = max(0, int(self.turns_var.get() or 0))
+
+        try:
+            # Reuse the CLI helper module so we have one source of truth
+            csm_task_path = SCRIPT_DIR / "csm_task.py"
+            if not csm_task_path.exists():
+                messagebox.showerror("Missing helper",
+                                      f"csm_task.py not found beside csm.pyw:\n{csm_task_path}")
+                return
+            cmd = [sys.executable, str(csm_task_path),
+                   self.target.get("alias") or self.target.get("session_id"),
+                   prompt,
+                   "--tools", self.tools_var.get().strip() or "Read,Edit,Bash"]
+            if self.continue_var.get():
+                cmd.append("--continue")
+            if source_session and n > 0:
+                cmd.extend(["--with-context", str(n),
+                            "--from", source_session.get("alias") or source_session.get("session_id")])
+
+            subprocess.Popen(cmd, creationflags=subprocess.CREATE_NO_WINDOW)
+            self.on_done(self.target.get("name", ""))
+            self.destroy()
+        except Exception as e:
+            messagebox.showerror("Run Task Failed", str(e))
 
 
 # --- Entry Point ---

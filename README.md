@@ -125,6 +125,39 @@ python csm_cli.py list          # list all aliases
 python csm_cli.py api           # resume the session aliased "api"
 ```
 
+### Cross-session task delegation
+
+Use **Run Task** to fire off a one-shot job in another project — without leaving your current session. Two ways to call it:
+
+**From CSM (UI):** Select the *target* session → toolbar **Run Task** button → type the prompt → Run. A new Windows Terminal tab opens, runs `claude -p "<prompt>" -C <target-cwd>`, and exits when done.
+
+**From inside another Claude session (CLI):** the `csm-task` helper is on `PATH` after install. Your active Claude can call it via its Bash tool:
+
+```bash
+csm-task <target-alias> "<prompt>" [--with-context N] [--from <source-alias>]
+                                   [--tools "Read,Edit,Bash"] [--continue]
+                                   [--print]
+```
+
+Examples:
+
+```bash
+# Fire-and-forget: add an endpoint in the API project
+csm-task api "Add a /healthz endpoint that returns 200"
+
+# Bring 20 turns of context from the current shell's most-recent .jsonl
+csm-task api "Apply the same auth refactor we did here" --with-context 20
+
+# Pull context from a specific session, append to target's existing conversation
+csm-task api "Continue the migration we discussed" \
+    --with-context 30 --from frontend --continue
+
+# Just print the command without launching
+csm-task api "test prompt" --print
+```
+
+Built on `claude -p` (non-interactive mode) — see [Claude Code CLI docs](https://docs.claude.com/en/docs/claude-code) for available flags.
+
 ## Keyboard shortcuts
 
 | Shortcut | Action |
