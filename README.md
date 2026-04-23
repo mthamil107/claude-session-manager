@@ -20,6 +20,13 @@
 - [Requirements](#requirements)
 - [Install](#install)
 - [Usage](#usage)
+  - [Add sessions](#add-sessions)
+  - [Launch](#launch)
+  - [Per-session model](#per-session-model)
+  - [Backup](#backup)
+  - [Restore](#restore)
+  - [CLI quick launch](#cli-quick-launch)
+  - [Cross-session task delegation](#cross-session-task-delegation)
 - [Keyboard shortcuts](#keyboard-shortcuts)
 - [How backups work](#how-backups-work)
 - [Recovering a deleted session](#recovering-a-deleted-session)
@@ -37,6 +44,8 @@
 - **Automatic backups** of every conversation `.jsonl` file on app startup
 - **Versioned snapshots** — keeps the last 10 backups per session, auto-prunes older ones
 - **One-click restore** of any historical backup, with a `.pre-restore-*` safety copy
+- **Per-session model selector** — pin Opus 4.7, Opus 4.6, Sonnet 4.6, Haiku 4.5, or leave it on Default
+- **Cross-session task delegation** (`Run Task` button + `csm-task` CLI) — fire a one-shot job into another project's Claude without leaving your current session, optionally with context from the calling session
 - **Scan & import** existing sessions — reads the real working directory from inside each `.jsonl`
 - **CLI launcher** (`csm_cli.py`) for keyboard-driven workflows
 - **Zero dependencies** — pure Python standard library (`tkinter`, `json`, `subprocess`, `pathlib`)
@@ -102,6 +111,28 @@ Or click **New** to enter a session ID manually.
 
 - Select a row → **Launch** (or double-click) — opens a new tab in Windows Terminal with the session name as the title
 - **Launch All** — opens every saved session at once (great for restoring an end-of-day workspace)
+
+### Per-session model
+
+Each session can pin a specific Claude model that gets used on launch. Edit a session (`F2`) and pick from the **Model** dropdown:
+
+| Label | Model id passed to `claude --model` |
+|-------|-------------------------------------|
+| Default (Claude Code chooses) | *(no `--model` flag)* |
+| Opus 4.7 | `claude-opus-4-7` |
+| Opus 4.6 | `claude-opus-4-6` |
+| Sonnet 4.6 | `claude-sonnet-4-6` |
+| Haiku 4.5 | `claude-haiku-4-5-20251001` |
+
+Common patterns:
+
+- **Default** for most sessions — let Claude Code pick
+- Pin **Opus 4.7** to architecture / debugging sessions
+- Pin **Haiku 4.5** to quick edit / cleanup sessions
+
+You can still override mid-conversation with the `/model` slash command inside Claude Code.
+
+> The conversation `.jsonl` stores messages, not a pinned model — switching models on `--resume` is fully supported by Claude Code. Watch the context-window cap, though: Sonnet 4.6 / Haiku 4.5 cap at ~200K tokens, while Opus 4.7 supports 1M with the `[1m]` variant.
 
 ### Backup
 
@@ -232,9 +263,11 @@ Tk ships with the Windows Python installer by default. On Linux: `sudo apt insta
 ```
 claude-session-manager/
 ├── csm.pyw                  # main GUI app (run with pythonw)
-├── csm_cli.py               # command-line launcher
-├── launch-csm.bat           # Windows double-click launcher
-├── csm-cli.bat              # CLI launcher
+├── csm_cli.py               # CLI: launch a session by alias
+├── csm_task.py              # CLI: cross-session task delegation (`csm-task`)
+├── launch-csm.bat           # Windows double-click launcher for the GUI
+├── csm-cli.bat              # Windows wrapper for csm_cli.py
+├── csm-task.bat             # Windows wrapper for csm_task.py
 ├── sessions.example.json    # template
 ├── sessions.json            # YOUR sessions  (gitignored)
 ├── session_backups/         # YOUR backups   (gitignored)
