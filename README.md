@@ -86,6 +86,14 @@ Then either:
 
 - Double-click `launch-csm.bat`
 - Run `pythonw csm.pyw` from any terminal
+- *(Recommended, one-time)* enable persistent tab titles in Windows Terminal so launched tabs show `Claude :: <session-name>` instead of `Claude Code`:
+
+  ```bash
+  python enable_wt_titles.py
+  ```
+
+  Backs up your WT `settings.json` and sets `profiles.defaults.suppressApplicationTitle = true`. Idempotent; safe to re-run.
+
 - *(Optional)* create a desktop shortcut:
 
 ```powershell
@@ -250,7 +258,12 @@ Claude Code requires the companion folder. Make sure both of these exist:
 CSM does this automatically on **Restore**. If you copied a file in by hand, create the folder yourself.
 
 **Tab title shows "Claude Code" instead of the session name.**
-In Windows Terminal: Settings → your PowerShell profile → Advanced → uncheck **Suppress title changes from the application**.
+Claude Code writes its own title at startup, overriding the one CSM sets via `wt --title`. Windows Terminal needs to be told to ignore the application title:
+
+- **Quick fix:** run `python enable_wt_titles.py` (or double-click `enable-wt-titles.bat`) once. It backs up your `settings.json`, then sets `profiles.defaults.suppressApplicationTitle = true` so all profiles ignore in-terminal title changes. Re-runnable; idempotent.
+- **Manual fix:** open Windows Terminal Settings (Ctrl+,) → your PowerShell profile → Advanced → enable **Suppress title changes from the application**. Or in `settings.json` add `"suppressApplicationTitle": true` inside `profiles.defaults`.
+
+Open a *new* tab after applying — existing tabs keep their old behavior.
 
 **`pythonw` not found.**
 Use `python` instead, or install Python from [python.org](https://www.python.org/downloads/) (the Microsoft Store build sometimes lacks `pythonw`).
@@ -268,6 +281,8 @@ claude-session-manager/
 ├── launch-csm.bat           # Windows double-click launcher for the GUI
 ├── csm-cli.bat              # Windows wrapper for csm_cli.py
 ├── csm-task.bat             # Windows wrapper for csm_task.py
+├── enable_wt_titles.py      # one-time WT settings tweak (persistent tab titles)
+├── enable-wt-titles.bat     # double-click wrapper for enable_wt_titles.py
 ├── sessions.example.json    # template
 ├── sessions.json            # YOUR sessions  (gitignored)
 ├── session_backups/         # YOUR backups   (gitignored)
