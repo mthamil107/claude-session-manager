@@ -15,6 +15,8 @@ from tkinter import ttk, messagebox, filedialog
 from pathlib import Path
 from datetime import datetime
 
+import pricing as _pricing
+
 # --- Windows DPI Awareness (fixes blurry/pixelated text) ---
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(2)  # Per-monitor DPI aware
@@ -390,6 +392,9 @@ class SessionManagerApp:
         self.sort_col = None
         self.sort_reverse = False
 
+        # Cost cache: session_id -> {"usd": float, "fingerprint": "size:mtime"}
+        self._cost_cache = {}
+
         self._configure_styles()
         self._build_menubar()
         self._build_toolbar()
@@ -402,6 +407,8 @@ class SessionManagerApp:
 
         # Auto-backup all .jsonl sessions on startup (background thread)
         self.root.after(500, self._auto_backup_on_start)
+        # Cost computation also in background once at startup
+        self.root.after(800, self._compute_all_costs_async)
 
     def _configure_styles(self):
         style = ttk.Style()
@@ -535,6 +542,7 @@ class SessionManagerApp:
         ToolbarButton(toolbar, text="Scan", command=self.scan_sessions).pack(side="left", padx=1)
         ToolbarButton(toolbar, text="Backup", command=self.backup_now).pack(side="left", padx=1)
         ToolbarButton(toolbar, text="Restore", command=self.restore_backup).pack(side="left", padx=1)
+        ToolbarButton(toolbar, text="Sync Costs", command=self.sync_costs).pack(side="left", padx=1)
 
         ToolbarSep(toolbar).pack(side="left", padx=6, pady=5)
 
@@ -614,7 +622,7 @@ class SessionManagerApp:
         tree_frame = tk.Frame(paned, bg=C["bg"])
         tree_frame.pack(side="left", fill="both", expand=True)
 
-        columns = ("name", "alias", "directory", "mode", "model", "session_id")
+        columns = ("name", "alias", "directory", "mode", "model", "cost", "session_id")
         self.tree = ttk.Treeview(tree_frame, columns=columns, show="headings",
                                   selectmode="browse")
 
@@ -626,14 +634,17 @@ class SessionManagerApp:
                           command=lambda: self._sort_by("cwd"))
         self.tree.heading("mode", text="Mode", anchor="center")
         self.tree.heading("model", text="Model", anchor="w")
+        self.tree.heading("cost", text="Cost", anchor="e",
+                          command=lambda: self._sort_by("_cost"))
         self.tree.heading("session_id", text="Session ID", anchor="w")
 
-        self.tree.column("name", width=220, minwidth=120)
-        self.tree.column("alias", width=120, minwidth=70)
-        self.tree.column("directory", width=300, minwidth=160)
-        self.tree.column("mode", width=70, minwidth=60, anchor="center")
-        self.tree.column("model", width=110, minwidth=80)
-        self.tree.column("session_id", width=240, minwidth=120)
+        self.tree.column("name", width=200, minwidth=120)
+        self.tree.column("alias", width=110, minwidth=70)
+        self.tree.column("directory", width=270, minwidth=140)
+        self.tree.column("mode", width=60, minwidth=50, anchor="center")
+        self.tree.column("model", width=100, minwidth=80)
+        self.tree.column("cost", width=80, minwidth=70, anchor="e")
+        self.tree.column("session_id", width=220, minwidth=120)
 
         scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=self._on_scroll)
         self.tree.configure(yscrollcommand=self._sync_scroll)
@@ -778,8 +789,9 @@ class SessionManagerApp:
             sid = s.get("session_id", "")
             model_id = s.get("model", "")
             model_label = MODEL_LABEL_BY_ID.get(model_id, model_id) if model_id else "Default"
-            # Compact label for the column
             model_short = model_label.replace("Default (Claude Code chooses)", "Default")
+            cost_usd = self._cost_cache.get(sid, {}).get("usd")
+            cost_str = _pricing.format_cost(cost_usd) if cost_usd is not None else "—"
 
             if filter_text:
                 if (filter_text not in name.lower() and
@@ -790,7 +802,9 @@ class SessionManagerApp:
                     continue
 
             tag = "odd" if count % 2 == 0 else "even"
-            self.tree.insert("", "end", values=(name, alias, cwd, mode, model_short, sid), tags=(tag,))
+            self.tree.insert("", "end",
+                             values=(name, alias, cwd, mode, model_short, cost_str, sid),
+                             tags=(tag,))
             count += 1
 
         self.status.set_segment("count", f"{count} sessions")
@@ -803,7 +817,13 @@ class SessionManagerApp:
         else:
             self.sort_col = key
             self.sort_reverse = False
-        self.sessions.sort(key=lambda s: s.get(key, "").lower(), reverse=self.sort_reverse)
+        if key == "_cost":
+            self.sessions.sort(
+                key=lambda s: self._cost_cache.get(s.get("session_id", ""), {}).get("usd", 0.0),
+                reverse=self.sort_reverse,
+            )
+        else:
+            self.sessions.sort(key=lambda s: str(s.get(key, "")).lower(), reverse=self.sort_reverse)
         self._populate_list()
         arrow = " v" if self.sort_reverse else " ^"
         self.status.set_main(f"Sorted by {key}{arrow}")
@@ -1064,6 +1084,91 @@ class SessionManagerApp:
             return
         RestoreDialog(self.root, session, backups,
                       lambda: self.status.flash("Session restored from backup", C["accent_green"]))
+
+    # --- Cost ---
+    def _resolve_session_jsonl(self, session):
+        """Find the .jsonl file for a session by id under ~/.claude/projects/*/."""
+        sid = session.get("session_id", "")
+        if not sid:
+            return None
+        for proj_dir in PROJECTS_DIR.iterdir():
+            if not proj_dir.is_dir():
+                continue
+            candidate = proj_dir / f"{sid}.jsonl"
+            if candidate.exists():
+                return candidate
+        return None
+
+    def _compute_all_costs_async(self):
+        """Walk every registered session's .jsonl and compute its cost in a thread."""
+        def worker():
+            try:
+                pricing_table = _pricing.load_pricing()
+            except Exception:
+                pricing_table = {}
+
+            updated = 0
+            for s in self.sessions:
+                sid = s.get("session_id", "")
+                jsonl = self._resolve_session_jsonl(s)
+                if not jsonl:
+                    continue
+                try:
+                    stat = jsonl.stat()
+                except Exception:
+                    continue
+                fp = f"{stat.st_size}:{int(stat.st_mtime)}"
+                cached = self._cost_cache.get(sid)
+                if cached and cached.get("fingerprint") == fp:
+                    continue
+                try:
+                    result = _pricing.compute_session_cost(jsonl, pricing_table)
+                    self._cost_cache[sid] = {
+                        "usd": result["total_usd"],
+                        "fingerprint": fp,
+                        "by_model": result["by_model"],
+                        "tokens": result["tokens"],
+                    }
+                    updated += 1
+                except Exception:
+                    pass
+
+            def report():
+                if updated > 0:
+                    total = sum(v.get("usd", 0) for v in self._cost_cache.values())
+                    self.status.flash(
+                        f"Costs updated for {updated} sessions  |  Total: {_pricing.format_cost(total)}",
+                        C["accent_green"]
+                    )
+                self._populate_list()
+            self.root.after(0, report)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def sync_costs(self):
+        """Fetch latest pricing from LiteLLM, then recompute all session costs."""
+        meta = _pricing.get_pricing_meta()
+        last = meta.get("synced_at") if meta else "never"
+        self.status.flash(f"Syncing pricing from LiteLLM... (last: {last})", C["accent_orange"])
+        self.root.update()
+
+        def worker():
+            try:
+                count, ts = _pricing.sync_pricing()
+                # Invalidate cache to force recompute against new prices
+                self._cost_cache.clear()
+                self.root.after(0, lambda: self.status.flash(
+                    f"Pricing synced ({count} models) — recomputing session costs...",
+                    C["accent_green"]))
+                self._compute_all_costs_async()
+            except Exception as e:
+                msg = str(e)
+                self.root.after(0, lambda: messagebox.showerror(
+                    "Sync Failed",
+                    f"Could not fetch pricing from LiteLLM:\n{msg}\n\n"
+                    f"Source: https://raw.githubusercontent.com/BerriAI/litellm/"
+                    f"main/model_prices_and_context_window.json"
+                ))
+        threading.Thread(target=worker, daemon=True).start()
 
     # --- Help ---
 

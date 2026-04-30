@@ -23,6 +23,7 @@
   - [Add sessions](#add-sessions)
   - [Launch](#launch)
   - [Per-session model](#per-session-model)
+  - [Cost tracking](#cost-tracking)
   - [Backup](#backup)
   - [Restore](#restore)
   - [CLI quick launch](#cli-quick-launch)
@@ -45,6 +46,7 @@
 - **Versioned snapshots** — keeps the last 10 backups per session, auto-prunes older ones
 - **One-click restore** of any historical backup, with a `.pre-restore-*` safety copy
 - **Per-session model selector** — pin Opus 4.7, Opus 4.6, Sonnet 4.6, Haiku 4.5, or leave it on Default
+- **Per-session cost tracking** with **Sync Costs** — pulls live pricing from [LiteLLM's price catalogue](https://github.com/BerriAI/litellm) (438+ models, updated weekly) and computes total USD per conversation
 - **Cross-session task delegation** (`Run Task` button + `csm-task` CLI) — fire a one-shot job into another project's Claude without leaving your current session, optionally with context from the calling session
 - **Scan & import** existing sessions — reads the real working directory from inside each `.jsonl`
 - **CLI launcher** (`csm_cli.py`) for keyboard-driven workflows
@@ -141,6 +143,20 @@ Common patterns:
 You can still override mid-conversation with the `/model` slash command inside Claude Code.
 
 > The conversation `.jsonl` stores messages, not a pinned model — switching models on `--resume` is fully supported by Claude Code. Watch the context-window cap, though: Sonnet 4.6 / Haiku 4.5 cap at ~200K tokens, while Opus 4.7 supports 1M with the `[1m]` variant.
+
+### Cost tracking
+
+CSM shows a **Cost** column for every session — total USD spent on that conversation, computed from the `usage` blocks every assistant message carries (`input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`) multiplied by per-token pricing.
+
+**Sync Costs** (toolbar button) pulls the latest pricing from [LiteLLM's `model_prices_and_context_window.json`](https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json) — a community-maintained catalogue of 438+ AI model prices, updated multiple times a week. The fetched data is cached locally to `pricing.json` (gitignored) and CSM falls back to bundled defaults if you're offline.
+
+- Click **Sync Costs** any time to refresh against the latest prices
+- Costs auto-recompute in the background after sync (or on app startup)
+- Cache is keyed on `<size>:<mtime>` — only changed `.jsonl` files get re-walked
+- Click the **Cost** column header to sort sessions by spend
+- Cells show "—" until the first compute finishes; sessions whose model isn't in the price table show $0.00
+
+> Pricing is per-token. Cache-write tokens are billed at ~25% premium; cache-read tokens at ~10% of standard input rate. CSM applies all four tiers correctly, so the total reflects actual API cost.
 
 ### Backup
 
@@ -283,6 +299,8 @@ claude-session-manager/
 ├── csm-task.bat             # Windows wrapper for csm_task.py
 ├── enable_wt_titles.py      # one-time WT settings tweak (persistent tab titles)
 ├── enable-wt-titles.bat     # double-click wrapper for enable_wt_titles.py
+├── pricing.py               # per-session cost calc + LiteLLM sync
+├── pricing.json             # latest synced pricing snapshot (gitignored)
 ├── sessions.example.json    # template
 ├── sessions.json            # YOUR sessions  (gitignored)
 ├── session_backups/         # YOUR backups   (gitignored)

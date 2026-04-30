@@ -4,6 +4,9 @@ session_backups/
 recover_session.ps1
 *.lnk
 
+# Synced pricing snapshot — refetched on demand from LiteLLM
+pricing.json
+
 # Pre-restore safety copies of session files
 *.pre-restore-*
 
