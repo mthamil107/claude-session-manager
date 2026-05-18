@@ -8,7 +8,7 @@
 > A desktop GUI for managing, launching, and **automatically backing up** your [Claude Code](https://claude.com/claude-code) sessions.
 > If you've ever lost a Claude Code conversation because the `.jsonl` file got cleaned up — this tool exists for you.
 
-<p align="center"><i>Pure Python, no dependencies, ~270 MB of conversations safely backed up on first launch.</i></p>
+<p align="center"><i>Pure Python, zero dependencies, every Claude conversation safely backed up on first launch.</i></p>
 
 ---
 
@@ -57,7 +57,12 @@
 
 ## Why this exists
 
-Claude Code stores each conversation as a `.jsonl` file in `~/.claude/projects/<encoded-project>/<session-id>.jsonl`. Those files can be deleted, lost, or rotated out of existence — and **there is no built-in backup**. Lose the file, lose the conversation. CSM solves that, while also giving you a fast way to launch any session by name.
+Two problems Claude Code has at scale:
+
+1. **No backup.** Each conversation is one `.jsonl` file under `~/.claude/projects/<encoded-project>/<session-id>.jsonl`. Files get deleted, rotated, or accidentally trashed — and they're gone for good with no recovery path.
+2. **No multi-session view.** When you're running Claude Code across 20+ projects with `/branch` carving each into smaller chains, the built-in `--resume` flag becomes an exercise in copy-pasting UUIDs.
+
+CSM gives you a single dark-UI dashboard for both: incremental versioned backups of every conversation, a tree view of every branch you've spawned, per-session model pinning, live cost tracking, one-click launch by name, and cross-session task delegation.
 
 ## Quick start
 
@@ -69,7 +74,15 @@ copy sessions.example.json sessions.json    # Windows
 pythonw csm.pyw
 ```
 
-Click **Scan** in the toolbar to discover and import your existing Claude sessions, then **Launch** any of them.
+Once CSM is open, here's the 60-second tour:
+
+1. **Scan** (toolbar) → pick sessions to register → see them in the list
+2. **Sync Costs** (toolbar) → fetches latest LiteLLM pricing → Cost column populates
+3. **View: Flat → View: Tree** (toolbar) → see every `/branch` child indented under its parent, grouped by project
+4. Double-click any session → launches in a new Windows Terminal tab titled `Claude :: <name>`
+5. Select a session → **Run Task** → fire a one-shot prompt into that project without leaving your current shell
+
+CSM auto-backs-up every conversation on startup — no setup required.
 
 ## Requirements
 
@@ -333,11 +346,13 @@ claude-session-manager/
 
 PRs welcome. Particularly valuable:
 
-- **macOS / Linux launch support** — currently launches via `wt.exe` + PowerShell
-- **Cloud backup destinations** — S3, Google Drive, Dropbox
-- **Full-text search** across all conversation contents
-- **Diff viewer** between backup snapshots
+- **macOS / Linux launch support** — currently uses `wt.exe` + PowerShell; needs equivalents for iTerm2, Alacritty, GNOME Terminal, tmux
+- **Cloud backup destinations** — S3, Google Drive, Dropbox; current backups are local-disk only
+- **Full-text search** across all conversation contents (not just session names)
+- **Diff viewer** between backup snapshots — visualize what changed in a `.jsonl` between two versions
+- **Cost charts** — burn-down per session, daily/weekly trend, model-mix pie
 - **Theme support** — currently dark only
+- **Per-tag organization** — group sessions by user-defined tags, not just by project folder
 
 Open an issue first if you want to discuss an approach.
 
