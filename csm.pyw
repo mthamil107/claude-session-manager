@@ -223,17 +223,25 @@ def discover_sessions():
             session_id = jsonl.stem
             preview = ""
             real_cwd = None
+            forked_from = None
+            logical_parent = None
             try:
                 with open(jsonl, "r", encoding="utf-8", errors="ignore") as f:
-                    for line in f:
+                    for i, line in enumerate(f):
+                        if i > 40:
+                            break
                         try:
                             rec = json.loads(line)
                         except Exception:
                             continue
-                        # Grab cwd from first record that has it
                         if real_cwd is None and isinstance(rec.get("cwd"), str) and rec["cwd"]:
                             real_cwd = rec["cwd"]
-                        # Grab first real user message as preview
+                        if forked_from is None:
+                            ff = rec.get("forkedFrom")
+                            if isinstance(ff, dict) and ff.get("sessionId"):
+                                forked_from = ff["sessionId"]
+                        if logical_parent is None and rec.get("logicalParentUuid"):
+                            logical_parent = rec["logicalParentUuid"]
                         if not preview and rec.get("type") == "user":
                             msg = rec.get("message", {})
                             content = msg.get("content", "")
@@ -244,7 +252,7 @@ def discover_sessions():
                                         break
                             if isinstance(content, str) and content.strip() and not content.startswith("<"):
                                 preview = content.strip().replace("\n", " ")[:60]
-                        if real_cwd and preview:
+                        if real_cwd and preview and forked_from is not None and logical_parent is not None:
                             break
             except Exception:
                 pass
@@ -261,6 +269,8 @@ def discover_sessions():
                 "source_dir": dir_name,
                 "mtime": mtime,
                 "size": size,
+                "forked_from": forked_from,
+                "logical_parent": logical_parent,
             })
     # Most recent first
     discovered.sort(key=lambda d: d.get("mtime", 0), reverse=True)
@@ -394,6 +404,10 @@ class SessionManagerApp:
 
         # Cost cache: session_id -> {"usd": float, "fingerprint": "size:mtime"}
         self._cost_cache = {}
+        # View mode: "flat" (registered sessions only) or "tree" (all on disk, grouped by project + parent)
+        self.view_mode = "flat"
+        # Cache discovery for tree mode
+        self._discovered_cache = []
 
         self._configure_styles()
         self._build_menubar()
@@ -543,6 +557,8 @@ class SessionManagerApp:
         ToolbarButton(toolbar, text="Backup", command=self.backup_now).pack(side="left", padx=1)
         ToolbarButton(toolbar, text="Restore", command=self.restore_backup).pack(side="left", padx=1)
         ToolbarButton(toolbar, text="Sync Costs", command=self.sync_costs).pack(side="left", padx=1)
+        self.view_btn = ToolbarButton(toolbar, text="View: Flat", command=self.toggle_view)
+        self.view_btn.pack(side="left", padx=1)
 
         ToolbarSep(toolbar).pack(side="left", padx=6, pady=5)
 
@@ -623,8 +639,12 @@ class SessionManagerApp:
         tree_frame.pack(side="left", fill="both", expand=True)
 
         columns = ("name", "alias", "directory", "mode", "model", "cost", "session_id")
-        self.tree = ttk.Treeview(tree_frame, columns=columns, show="headings",
+        # show="tree headings" gives us an expandable left column for the tree view;
+        # the tree column is hidden in flat mode via column width.
+        self.tree = ttk.Treeview(tree_frame, columns=columns, show="tree headings",
                                   selectmode="browse")
+        # Hide the tree column by default (flat mode); _apply_view_mode toggles its width.
+        self.tree.column("#0", width=0, stretch=False, minwidth=0)
 
         self.tree.heading("name", text="Name", anchor="w",
                           command=lambda: self._sort_by("name"))
@@ -658,6 +678,8 @@ class SessionManagerApp:
         # Alternating row tags
         self.tree.tag_configure("odd", background=C["bg"])
         self.tree.tag_configure("even", background=C["bg_light"])
+        # Tree-mode project header style
+        self.tree.tag_configure("project", background=C["bg_toolbar"], foreground=C["text_bright"])
 
         # --- Detail bar below list ---
         detail_bar = tk.Frame(self.main_frame, bg=C["bg_lighter"], height=38)
@@ -778,6 +800,9 @@ class SessionManagerApp:
     # --- Data Methods ---
 
     def _populate_list(self):
+        if self.view_mode == "tree":
+            self._populate_tree()
+            return
         self.tree.delete(*self.tree.get_children())
         filter_text = self.search_var.get().lower()
         count = 0
@@ -810,6 +835,128 @@ class SessionManagerApp:
         self.status.set_segment("count", f"{count} sessions")
         matches = f" ({count} matches)" if filter_text else ""
         self.status.set_main(f"Ready{matches}")
+
+    def toggle_view(self):
+        self.view_mode = "tree" if self.view_mode == "flat" else "flat"
+        self.view_btn.config(text=f"View: {'Tree' if self.view_mode == 'tree' else 'Flat'}")
+        self._apply_view_mode()
+        self._populate_list()
+
+    def _apply_view_mode(self):
+        if self.view_mode == "tree":
+            self.tree.column("#0", width=320, stretch=False, minwidth=200)
+            # Hide redundant columns in tree mode (the tree column shows them via labels)
+            self.tree.column("name", width=0, stretch=False, minwidth=0)
+            self.tree.column("alias", width=0, stretch=False, minwidth=0)
+        else:
+            self.tree.column("#0", width=0, stretch=False, minwidth=0)
+            self.tree.column("name", width=200, minwidth=120, stretch=True)
+            self.tree.column("alias", width=110, minwidth=70, stretch=False)
+
+    def _populate_tree(self):
+        """Show all .jsonl on disk grouped by project, then by branch parent chain."""
+        self.tree.delete(*self.tree.get_children())
+        if not self._discovered_cache:
+            self._discovered_cache = discover_sessions()
+        filter_text = self.search_var.get().lower()
+
+        # Index everything by session_id and known status
+        registered_by_id = {s.get("session_id"): s for s in self.sessions}
+        by_id = {d["session_id"]: d for d in self._discovered_cache}
+
+        # Bucket by project folder
+        by_project = {}
+        for d in self._discovered_cache:
+            by_project.setdefault(d["source_dir"], []).append(d)
+
+        # Sort projects by most-recent activity desc
+        proj_order = sorted(
+            by_project.keys(),
+            key=lambda p: max((x.get("mtime", 0) for x in by_project[p]), default=0),
+            reverse=True,
+        )
+
+        total_rows = 0
+        for proj in proj_order:
+            children = by_project[proj]
+            # Build parent map: child_id -> parent_id (only when parent exists in same project)
+            project_ids = {c["session_id"] for c in children}
+            roots = [c for c in children if not c.get("forked_from") or c.get("forked_from") not in project_ids]
+            kids_of = {}
+            for c in children:
+                pf = c.get("forked_from")
+                if pf and pf in project_ids:
+                    kids_of.setdefault(pf, []).append(c)
+
+            # Project header row
+            proj_iid = f"proj::{proj}"
+            self.tree.insert("", "end", iid=proj_iid, text=f"  📁 {proj}  ({len(children)})",
+                             values=("", "", "", "", "", "", ""), open=True, tags=("project",))
+
+            # Sort roots by mtime desc, recurse
+            def _row_label(d):
+                reg = registered_by_id.get(d["session_id"])
+                star = "★ " if reg else ""
+                nm = (reg.get("name") if reg else d.get("name", "")) or d["session_id"][:8]
+                return f"{star}{nm}"
+
+            def _row_values(d):
+                reg = registered_by_id.get(d["session_id"])
+                alias = (reg or {}).get("alias", "")
+                mode_v = "Auto" if (reg or {}).get("skip_permissions") else ""
+                model_id = (reg or {}).get("model", "")
+                model_lbl = MODEL_LABEL_BY_ID.get(model_id, model_id) if model_id else "Default"
+                model_short = model_lbl.replace("Default (Claude Code chooses)", "Default")
+                cost_usd = self._cost_cache.get(d["session_id"], {}).get("usd")
+                cost_str = _pricing.format_cost(cost_usd) if cost_usd is not None else "—"
+                return ("", alias, d.get("cwd", ""), mode_v, model_short, cost_str, d["session_id"])
+
+            def _matches_filter(d):
+                if not filter_text:
+                    return True
+                hay = " ".join([
+                    (registered_by_id.get(d["session_id"]) or {}).get("name", "") or "",
+                    (registered_by_id.get(d["session_id"]) or {}).get("alias", "") or "",
+                    d.get("name", ""),
+                    d.get("cwd", ""),
+                    d.get("session_id", ""),
+                ]).lower()
+                return filter_text in hay
+
+            def _insert(parent_iid, node, depth=0):
+                if not (_matches_filter(node) or any(_matches_filter(k) for k in _all_descendants(node))):
+                    return 0
+                iid = node["session_id"]
+                try:
+                    self.tree.insert(parent_iid, "end", iid=iid, text=_row_label(node),
+                                     values=_row_values(node), open=(depth < 1))
+                except tk.TclError:
+                    # Duplicate iid (shouldn't happen but be safe)
+                    return 0
+                count_local = 1
+                for kid in sorted(kids_of.get(node["session_id"], []), key=lambda x: x.get("mtime", 0), reverse=True):
+                    count_local += _insert(iid, kid, depth + 1)
+                return count_local
+
+            def _all_descendants(node):
+                stack = list(kids_of.get(node["session_id"], []))
+                out = []
+                while stack:
+                    n = stack.pop()
+                    out.append(n)
+                    stack.extend(kids_of.get(n["session_id"], []))
+                return out
+
+            for r in sorted(roots, key=lambda x: x.get("mtime", 0), reverse=True):
+                total_rows += _insert(proj_iid, r)
+
+            # Hide empty project headers when search filtered everything out
+            if not self.tree.get_children(proj_iid):
+                self.tree.delete(proj_iid)
+
+        self.status.set_segment("count", f"{total_rows} sessions")
+        matches = f" ({total_rows} matches)" if filter_text else ""
+        self.status.set_main(f"Tree view  ({len(proj_order)} projects){matches}")
 
     def _sort_by(self, key):
         if self.sort_col == key:
@@ -847,8 +994,29 @@ class SessionManagerApp:
         sel = self.tree.selection()
         if not sel:
             return None
-        values = self.tree.item(sel[0], "values")
-        name = values[0]
+        iid = sel[0]
+        # Tree mode: skip project headers; lookup by session_id in registered list,
+        # otherwise build an ad-hoc session dict from the discovered cache.
+        if iid.startswith("proj::"):
+            return None
+        if self.view_mode == "tree":
+            for s in self.sessions:
+                if s.get("session_id") == iid:
+                    return s
+            for d in self._discovered_cache:
+                if d.get("session_id") == iid:
+                    return {
+                        "name": d.get("name", "")[:40] or iid[:8],
+                        "alias": iid[:8],
+                        "session_id": iid,
+                        "cwd": d.get("cwd", ""),
+                        "skip_permissions": True,
+                        "model": "",
+                    }
+            return None
+        # Flat mode: original behavior
+        values = self.tree.item(iid, "values")
+        name = values[0] if values else ""
         for s in self.sessions:
             if s.get("name") == name:
                 return s
@@ -1011,6 +1179,7 @@ class SessionManagerApp:
         self.status.flash("Scanning Claude storage...", C["accent_orange"])
         self.root.update()
         discovered = discover_sessions()
+        self._discovered_cache = discovered
         existing_ids = {s["session_id"] for s in self.sessions}
         new_sessions = [d for d in discovered if d["session_id"] not in existing_ids]
 

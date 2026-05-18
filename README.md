@@ -24,6 +24,7 @@
   - [Launch](#launch)
   - [Per-session model](#per-session-model)
   - [Cost tracking](#cost-tracking)
+  - [Tree view (branches)](#tree-view-branches)
   - [Backup](#backup)
   - [Restore](#restore)
   - [CLI quick launch](#cli-quick-launch)
@@ -47,6 +48,7 @@
 - **One-click restore** of any historical backup, with a `.pre-restore-*` safety copy
 - **Per-session model selector** — pin Opus 4.7, Opus 4.6, Sonnet 4.6, Haiku 4.5, or leave it on Default
 - **Per-session cost tracking** with **Sync Costs** — pulls live pricing from [LiteLLM's price catalogue](https://github.com/BerriAI/litellm) (438+ models, updated weekly) and computes total USD per conversation
+- **Tree view** (`View: Flat` / `View: Tree` toggle) — groups every `.jsonl` on disk by project folder, then shows `/branch`-spawned children indented under their parent session
 - **Cross-session task delegation** (`Run Task` button + `csm-task` CLI) — fire a one-shot job into another project's Claude without leaving your current session, optionally with context from the calling session
 - **Scan & import** existing sessions — reads the real working directory from inside each `.jsonl`
 - **CLI launcher** (`csm_cli.py`) for keyboard-driven workflows
@@ -157,6 +159,22 @@ CSM shows a **Cost** column for every session — total USD spent on that conver
 - Cells show "—" until the first compute finishes; sessions whose model isn't in the price table show $0.00
 
 > Pricing is per-token. Cache-write tokens are billed at ~25% premium; cache-read tokens at ~10% of standard input rate. CSM applies all four tiers correctly, so the total reflects actual API cost.
+
+### Tree view (branches)
+
+Click the **View: Flat / View: Tree** toggle in the toolbar to switch between two modes:
+
+- **Flat** (default): the sessions you've registered in `sessions.json`, one per row
+- **Tree**: every `.jsonl` on disk grouped by project folder, with `/branch`-spawned children indented under their parent session
+
+Tree mode reads `forkedFrom.sessionId` from each `.jsonl` (Claude Code writes this near the start of any session created with `/branch`) and builds a parent → children hierarchy. Registered sessions show a `★` prefix; unregistered ones use the first user message as the label.
+
+Useful for:
+- Seeing all the branches you spun off a long-running session in one glance
+- Spotting orphan branches whose parent was deleted
+- Picking any branch to launch directly — even ones you never added to `sessions.json`
+
+> Tree mode walks every `.jsonl` under `~/.claude/projects/` and reads the first ~40 records of each to extract the branch parent. On a large workspace this can take a second on the first toggle; subsequent toggles are cached.
 
 ### Backup
 
