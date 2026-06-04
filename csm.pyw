@@ -786,6 +786,8 @@ class SessionManagerApp:
 
         self.tree.bind("<Double-1>", lambda e: self.launch_session())
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
+        self.tree.bind("<Button-3>", self._show_context_menu)
+        self._build_context_menu()
 
         # Alternating row tags
         self.tree.tag_configure("odd", background=C["bg"])
@@ -1286,6 +1288,130 @@ class SessionManagerApp:
             self._update_status_segments()
             self.detail_label.config(text="  Select a session to view details",
                                       fg=C["text_dim"])
+
+    def _build_context_menu(self):
+        """Right-click popup for individual session rows."""
+        m = tk.Menu(self.root, tearoff=False, bg=C["bg_menubar"], fg=C["text"],
+                    activebackground=C["accent"], activeforeground=C["text_white"],
+                    font=("Segoe UI", 12), relief="flat", borderwidth=0)
+        m.add_command(label="Launch                              Enter",
+                      command=self.launch_session)
+        m.add_command(label="Run Task...",
+                      command=self.run_task)
+        m.add_separator()
+        m.add_command(label="Auto-rename this session",
+                      command=self.auto_rename_selected)
+        m.add_command(label="Edit...                              F2",
+                      command=self.edit_session)
+        m.add_command(label="Duplicate",
+                      command=self.duplicate_session)
+        m.add_separator()
+        m.add_command(label="Open folder                  Ctrl+O",
+                      command=self.open_folder)
+        m.add_command(label="Restore from backup...",
+                      command=self.restore_backup)
+        m.add_separator()
+        m.add_command(label="Remove                             Del",
+                      command=self.remove_session)
+        self._ctx_menu = m
+
+    def _show_context_menu(self, event):
+        """Select the row under the pointer, then pop up the context menu."""
+        row_id = self.tree.identify_row(event.y)
+        if row_id and row_id.startswith("proj::"):
+            return  # don't pop a menu on a tree-view project header
+        if row_id:
+            self.tree.selection_set(row_id)
+            self.tree.focus(row_id)
+        if not self._get_selected_session():
+            return
+        try:
+            self._ctx_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self._ctx_menu.grab_release()
+
+    def auto_rename_selected(self):
+        """Rename just the currently-selected session using the same proposal logic."""
+        session = self._get_selected_session()
+        if not session:
+            return
+        if not self._discovered_cache:
+            self._discovered_cache = discover_sessions()
+        proposals = compute_rename_proposals([session], self._discovered_cache)
+        if not proposals:
+            return
+        p = proposals[0]
+        if p["source"] == "missing":
+            messagebox.showinfo("Auto-rename",
+                                f"\"{session.get('name','')}\"\n\nNo .jsonl on disk for this session.")
+            return
+        if not p["proposed"] or p["proposed"] == p["current"]:
+            messagebox.showinfo("Auto-rename",
+                                f"\"{session.get('name','')}\"\n\nAlready matches its first prompt — nothing to change.")
+            return
+
+        proposed = self._prompt_for_name(
+            title="Auto-rename this session",
+            label=f"Source: {p['source'].upper()}\n\nCurrent:   {p['current']}\n\nProposed:",
+            initial=p["proposed"],
+        )
+        if not proposed or proposed == p["current"]:
+            return
+
+        updated, backup = apply_rename_proposals(self.sessions, {session.get("session_id"): proposed})
+        self._populate_list()
+        if updated:
+            self.status.flash(
+                f'Renamed to "{proposed[:50]}"  (backup: {backup.name if backup else "none"})',
+                C["accent_green"],
+            )
+
+    def _prompt_for_name(self, title, label, initial):
+        """Small inline dialog with a single editable text field. Returns trimmed value or None."""
+        top = tk.Toplevel(self.root)
+        top.title(title)
+        top.configure(bg=C["bg"])
+        top.transient(self.root)
+        top.grab_set()
+        W, H = 640, 240
+        top.geometry(f"{W}x{H}")
+        top.minsize(520, 220)
+        self.root.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - W) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - H) // 2
+        top.geometry(f"+{x}+{y}")
+
+        tk.Label(top, text=label, bg=C["bg"], fg=C["text"], justify="left",
+                 font=("Segoe UI", 12), anchor="w").pack(fill="x", padx=18, pady=(16, 6))
+        var = tk.StringVar(value=initial)
+        entry = tk.Entry(top, textvariable=var, bg=C["bg_input"], fg=C["text_bright"],
+                         insertbackground=C["text_bright"], font=("Segoe UI", 13),
+                         relief="flat", highlightthickness=1,
+                         highlightbackground=C["border"], highlightcolor=C["accent"])
+        entry.pack(fill="x", padx=18, pady=4, ipady=4)
+        entry.select_range(0, "end")
+        entry.focus_set()
+
+        result = {"value": None}
+        def _ok():
+            result["value"] = var.get().strip()
+            top.destroy()
+        def _cancel():
+            top.destroy()
+
+        btn_bar = tk.Frame(top, bg=C["bg_lighter"])
+        btn_bar.pack(fill="x", side="bottom")
+        tk.Button(btn_bar, text="Cancel", bg=C["bg_toolbar"], fg=C["text"],
+                  font=("Segoe UI", 12), relief="flat", padx=14, pady=6,
+                  cursor="hand2", command=_cancel).pack(side="right", padx=8, pady=10)
+        tk.Button(btn_bar, text="Save", bg=C["accent"], fg=C["text_white"],
+                  font=("Segoe UI", 12, "bold"), relief="flat", padx=14, pady=6,
+                  cursor="hand2", command=_ok).pack(side="right", pady=10)
+
+        entry.bind("<Return>", lambda e: _ok())
+        entry.bind("<Escape>", lambda e: _cancel())
+        self.root.wait_window(top)
+        return result["value"]
 
     def auto_rename_sessions(self):
         """Compute proposed names from each session's first prompt + parent and
