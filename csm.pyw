@@ -185,6 +185,70 @@ def list_session_backups(session_id):
     return result
 
 
+# --- Prompt extraction (for View Prompts dialog) ---
+
+_PROMPT_SKIP_PREFIXES = (
+    "this session is being continued",
+    "caveat: the messages below",
+    "[request interrupted",
+)
+
+
+def extract_user_prompts(jsonl_path):
+    """Walk a .jsonl and return a list of {idx, timestamp, text} dicts — one per
+    real user prompt. Skips Claude Code's auto-generated noise (continuation
+    markers, IDE caveats, tool-result echoes, system tags)."""
+    prompts = []
+    idx = 0
+    try:
+        with open(jsonl_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                if rec.get("type") != "user":
+                    continue
+                msg = rec.get("message", {})
+                content = msg.get("content", "")
+                # User messages can be string, or list of typed blocks (text, tool_result, image, ...)
+                if isinstance(content, list):
+                    parts = []
+                    saw_tool_result = False
+                    for c in content:
+                        if not isinstance(c, dict):
+                            continue
+                        if c.get("type") == "tool_result":
+                            saw_tool_result = True
+                            continue
+                        if c.get("type") == "text":
+                            t = c.get("text", "")
+                            if t:
+                                parts.append(t)
+                    if saw_tool_result and not parts:
+                        # Pure tool-result echo, not a typed prompt
+                        continue
+                    content = "\n".join(parts).strip()
+                if not isinstance(content, str):
+                    continue
+                content = content.strip()
+                if not content:
+                    continue
+                lower = content.lower()
+                if (content.startswith("<")
+                        or any(lower.startswith(p) for p in _PROMPT_SKIP_PREFIXES)):
+                    continue
+                idx += 1
+                prompts.append({
+                    "idx": idx,
+                    "timestamp": rec.get("timestamp") or "",
+                    "text": content,
+                })
+    except Exception:
+        return prompts
+    return prompts
+
+
 # --- Auto-rename helpers ---
 
 def _clean_name(text, max_len):
@@ -1289,6 +1353,25 @@ class SessionManagerApp:
             self.detail_label.config(text="  Select a session to view details",
                                       fg=C["text_dim"])
 
+    def view_prompts(self):
+        """Open a dialog showing every user prompt in the selected session, in order."""
+        session = self._get_selected_session()
+        if not session:
+            return
+        jsonl = self._resolve_session_jsonl(session)
+        if not jsonl:
+            messagebox.showinfo("View Prompts",
+                                f"No .jsonl on disk for this session.\n\n"
+                                f"Session ID: {session.get('session_id','')}")
+            return
+        prompts = extract_user_prompts(jsonl)
+        if not prompts:
+            messagebox.showinfo("View Prompts",
+                                "No user prompts found in this session.\n"
+                                "(All entries were system markers, tool results, or continuations.)")
+            return
+        SessionPromptsDialog(self.root, session, prompts)
+
     def _build_context_menu(self):
         """Right-click popup for individual session rows."""
         m = tk.Menu(self.root, tearoff=False, bg=C["bg_menubar"], fg=C["text"],
@@ -1299,6 +1382,8 @@ class SessionManagerApp:
         m.add_command(label="Run Task...",
                       command=self.run_task)
         m.add_separator()
+        m.add_command(label="View Prompts...",
+                      command=self.view_prompts)
         m.add_command(label="Auto-rename this session",
                       command=self.auto_rename_selected)
         m.add_command(label="Edit...                              F2",
@@ -2156,6 +2241,192 @@ class AutoRenameDialog(tk.Toplevel):
         self.canvas.unbind_all("<MouseWheel>")
         self.on_apply(accepted)
         self.destroy()
+
+
+class SessionPromptsDialog(tk.Toplevel):
+    """Two-pane dialog: searchable list of every user prompt (top), full text of
+    the selected prompt (bottom). Click a row to expand it."""
+
+    def __init__(self, parent, session, prompts):
+        super().__init__(parent)
+        self.session = session
+        self.all_prompts = prompts
+
+        W, H = 1100, 720
+        self.title(f"Prompts — {session.get('name','')}")
+        self.geometry(f"{W}x{H}")
+        self.minsize(820, 560)
+        self.configure(bg=C["bg"])
+        self.transient(parent)
+        self.update_idletasks()
+        x = parent.winfo_x() + (parent.winfo_width() - W) // 2
+        y = parent.winfo_y() + (parent.winfo_height() - H) // 2
+        self.geometry(f"+{x}+{y}")
+
+        # Header
+        header = tk.Frame(self, bg=C["bg_toolbar"], height=52)
+        header.pack(fill="x")
+        header.pack_propagate(False)
+        tk.Label(header, text=f"  {session.get('name','')}",
+                 bg=C["bg_toolbar"], fg=C["text_bright"],
+                 font=("Segoe UI", 14, "bold")).pack(side="left", fill="y")
+        tk.Label(header, text=f"{len(prompts)} prompts   ·   {session.get('session_id','')[:8]}  ",
+                 bg=C["bg_toolbar"], fg=C["text_dim"],
+                 font=("Segoe UI", 11)).pack(side="right", fill="y")
+        tk.Frame(self, bg=C["border"], height=1).pack(fill="x")
+
+        # Search row
+        search_row = tk.Frame(self, bg=C["bg"])
+        search_row.pack(fill="x", padx=14, pady=(10, 6))
+        tk.Label(search_row, text="Find:", bg=C["bg"], fg=C["text_dim"],
+                 font=("Segoe UI", 12)).pack(side="left", padx=(0, 6))
+        self.search_var = tk.StringVar()
+        self.search_var.trace_add("write", lambda *a: self._refilter())
+        search_entry = tk.Entry(search_row, textvariable=self.search_var,
+                                 bg=C["bg_input"], fg=C["text_bright"],
+                                 insertbackground=C["text_bright"],
+                                 font=("Segoe UI", 12), relief="flat",
+                                 highlightthickness=1, highlightbackground=C["border"],
+                                 highlightcolor=C["accent"])
+        search_entry.pack(side="left", fill="x", expand=True, ipady=3)
+        search_entry.focus_set()
+
+        # Match count label updated on filter
+        self.match_label = tk.Label(search_row, text="", bg=C["bg"], fg=C["text_dim"],
+                                     font=("Segoe UI", 11))
+        self.match_label.pack(side="right", padx=(10, 0))
+
+        # PanedWindow: top = list, bottom = full text
+        paned = tk.PanedWindow(self, orient="vertical", bg=C["border"], sashwidth=4,
+                                bd=0, relief="flat")
+        paned.pack(fill="both", expand=True, padx=14, pady=(2, 12))
+
+        # ----- Top: prompt list -----
+        list_frame = tk.Frame(paned, bg=C["bg"])
+        paned.add(list_frame, minsize=200, height=380)
+
+        cols = ("idx", "when", "snippet")
+        self.tree = ttk.Treeview(list_frame, columns=cols, show="headings", selectmode="browse")
+        self.tree.heading("idx", text="#", anchor="e")
+        self.tree.heading("when", text="When", anchor="w")
+        self.tree.heading("snippet", text="Prompt", anchor="w")
+        self.tree.column("idx", width=50, anchor="e", stretch=False)
+        self.tree.column("when", width=170, anchor="w", stretch=False)
+        self.tree.column("snippet", width=720, anchor="w", stretch=True)
+        self.tree.tag_configure("odd", background=C["bg"])
+        self.tree.tag_configure("even", background=C["bg_light"])
+
+        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scrollbar.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        self.tree.bind("<<TreeviewSelect>>", lambda e: self._on_select())
+
+        # ----- Bottom: full text -----
+        detail_frame = tk.Frame(paned, bg=C["bg"])
+        paned.add(detail_frame, minsize=160, height=240)
+
+        tk.Label(detail_frame, text="Full text of selected prompt:",
+                 bg=C["bg"], fg=C["text_dim"], font=("Segoe UI", 11),
+                 anchor="w").pack(fill="x", padx=4, pady=(6, 4))
+
+        text_outer = tk.Frame(detail_frame, bg=C["bg"])
+        text_outer.pack(fill="both", expand=True, padx=2, pady=2)
+        self.text = tk.Text(text_outer, bg=C["bg_input"], fg=C["text_bright"],
+                             insertbackground=C["text_bright"], font=("Consolas", 12),
+                             relief="flat", highlightthickness=1,
+                             highlightbackground=C["border"], wrap="word",
+                             padx=10, pady=8)
+        text_scroll = ttk.Scrollbar(text_outer, orient="vertical", command=self.text.yview)
+        self.text.configure(yscrollcommand=text_scroll.set, state="disabled")
+        self.text.pack(side="left", fill="both", expand=True)
+        text_scroll.pack(side="right", fill="y")
+
+        # Buttons
+        tk.Frame(self, bg=C["border"], height=1).pack(fill="x", side="bottom")
+        btn_bar = tk.Frame(self, bg=C["bg_lighter"], height=48)
+        btn_bar.pack(fill="x", side="bottom")
+        btn_bar.pack_propagate(False)
+        tk.Button(btn_bar, text="Close", bg=C["bg_toolbar"], fg=C["text"],
+                  font=("Segoe UI", 12), relief="flat", padx=16, pady=6,
+                  cursor="hand2", command=self.destroy).pack(side="right", padx=8, pady=8)
+        tk.Button(btn_bar, text="Copy selected prompt", bg=C["bg_toolbar"], fg=C["text"],
+                  font=("Segoe UI", 12), relief="flat", padx=14, pady=6,
+                  cursor="hand2", command=self._copy_selected).pack(side="right", padx=4, pady=8)
+
+        self.bind("<Escape>", lambda e: self.destroy())
+
+        self._populate(prompts)
+
+    def _populate(self, prompts):
+        self.tree.delete(*self.tree.get_children())
+        for i, p in enumerate(prompts):
+            snippet = " ".join(p["text"].split())
+            if len(snippet) > 200:
+                snippet = snippet[:200] + "..."
+            when = self._fmt_when(p.get("timestamp", ""))
+            tag = "odd" if i % 2 == 0 else "even"
+            self.tree.insert("", "end", iid=str(p["idx"]),
+                             values=(p["idx"], when, snippet), tags=(tag,))
+        self.match_label.config(text=f"{len(prompts)} of {len(self.all_prompts)} shown")
+        # Auto-select first row so the detail pane has content
+        if prompts:
+            first_iid = str(prompts[0]["idx"])
+            self.tree.selection_set(first_iid)
+            self.tree.focus(first_iid)
+
+    def _refilter(self):
+        q = self.search_var.get().strip().lower()
+        if not q:
+            self._populate(self.all_prompts)
+            return
+        filtered = [p for p in self.all_prompts if q in p["text"].lower()]
+        self._populate(filtered)
+
+    def _on_select(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        try:
+            idx = int(sel[0])
+        except ValueError:
+            return
+        p = next((x for x in self.all_prompts if x["idx"] == idx), None)
+        if not p:
+            return
+        self.text.config(state="normal")
+        self.text.delete("1.0", "end")
+        self.text.insert("1.0", p["text"])
+        self.text.config(state="disabled")
+
+    def _copy_selected(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        try:
+            idx = int(sel[0])
+        except ValueError:
+            return
+        p = next((x for x in self.all_prompts if x["idx"] == idx), None)
+        if not p:
+            return
+        self.clipboard_clear()
+        self.clipboard_append(p["text"])
+        # Brief flash on the title bar
+        original = self.title()
+        self.title(original + "   (copied)")
+        self.after(900, lambda: self.title(original))
+
+    @staticmethod
+    def _fmt_when(ts_iso):
+        if not ts_iso:
+            return ""
+        # Examples: "2026-04-13T11:32:45.123Z" -> "2026-04-13 11:32"
+        if "T" in ts_iso:
+            date, rest = ts_iso.split("T", 1)
+            time = rest.split(".")[0].split("Z")[0][:5]
+            return f"{date} {time}"
+        return ts_iso[:16]
 
 
 class RunTaskDialog(tk.Toplevel):

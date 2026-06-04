@@ -26,6 +26,7 @@
   - [Cost tracking](#cost-tracking)
   - [Tree view (branches)](#tree-view-branches)
   - [Auto-rename sessions](#auto-rename-sessions)
+  - [View Prompts (right-click)](#view-prompts-right-click)
   - [Backup](#backup)
   - [Restore](#restore)
   - [CLI quick launch](#cli-quick-launch)
@@ -209,6 +210,17 @@ When you click **Apply Selected**, your current `sessions.json` is copied to `se
 - Skips IDE-injection caveats and interruption messages
 - Skips records that start with `<` (system tags)
 - Uses the parent's **own first prompt** as the prefix, not its already-prefixed name — so you never see cascading "A » B » C » D" chains
+
+### View Prompts (right-click)
+
+Right-click any session row → **View Prompts...** opens a two-pane dialog that lists every real user prompt you typed in that conversation, in order:
+
+- **Top pane:** a numbered list of `#`, timestamp, and 200-char snippet of each prompt — searchable with the Find box (filters as you type)
+- **Bottom pane:** the full text of whichever prompt is selected, in a wrap-word read-only text area
+
+Other actions on the right-click menu: **Launch**, **Run Task...**, **Auto-rename this session**, **Edit...** (F2), **Duplicate**, **Open folder** (Ctrl+O), **Restore from backup...**, **Remove** (Del).
+
+The same prompt-extraction logic that powers Auto-rename is used here — Claude Code's continuation markers, IDE caveats, interruption messages, and tool-result echoes are filtered out so you only see what you actually typed. Click **Copy selected prompt** to copy it to the clipboard.
 
 ### Backup
 
