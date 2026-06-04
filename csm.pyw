@@ -185,6 +185,109 @@ def list_session_backups(session_id):
     return result
 
 
+# --- Auto-rename helpers ---
+
+def _clean_name(text, max_len):
+    """Normalize a string for use as a session name: collapse whitespace,
+    drop leading/trailing punctuation, hard-cap length."""
+    if not text:
+        return ""
+    text = " ".join(text.split())
+    text = text.strip(" \t\n\r\"'`-—_:;,.()[]{}")
+    if len(text) > max_len:
+        text = text[:max_len].rstrip() + "..."
+    return text
+
+
+def compute_rename_proposals(sessions, discovered):
+    """Build a list of {session, current, proposed, source} dicts.
+
+    - Root sessions: proposed = first user prompt (truncated)
+    - Branched sessions: proposed = "<parent name> » <first prompt>"
+    - Missing-on-disk sessions: proposed = "" (skipped)
+    """
+    by_id = {d["session_id"]: d for d in discovered}
+    registered_by_id = {s.get("session_id"): s for s in sessions}
+
+    proposals = []
+    for s in sessions:
+        sid = s.get("session_id", "")
+        current = s.get("name", "")
+        disc = by_id.get(sid)
+        if not disc:
+            proposals.append({
+                "session": s,
+                "current": current,
+                "proposed": "",
+                "source": "missing",
+            })
+            continue
+
+        first_prompt = (disc.get("name") or "").strip()
+        # If discover_sessions fell back to a session-id stub, treat as empty
+        if first_prompt.endswith("...") and len(first_prompt) <= 20 and first_prompt.replace("-", "").replace(".", "").isalnum():
+            first_prompt = ""
+
+        forked_from = disc.get("forked_from")
+        if forked_from:
+            # Prefer parent's discovered first prompt (clean, single-layer) over
+            # its registered name to avoid cascading "A » B » C" nesting.
+            parent_disc = by_id.get(forked_from)
+            parent_reg = registered_by_id.get(forked_from)
+            parent_name = ""
+            if parent_disc and parent_disc.get("name") and not parent_disc.get("name", "").endswith("..."):
+                parent_name = parent_disc["name"]
+            elif parent_reg and parent_reg.get("name"):
+                # Strip any existing branch prefix so we don't compound it
+                pname = parent_reg["name"]
+                parent_name = pname.split(" » ")[0] if " » " in pname else pname
+            parent_short = _clean_name(parent_name, 25)
+            prompt_short = _clean_name(first_prompt, 50) or sid[:8]
+            if parent_short:
+                proposed = f"{parent_short} » {prompt_short}"
+            else:
+                proposed = prompt_short
+            source = "branch"
+        else:
+            proposed = _clean_name(first_prompt, 75) or sid[:8]
+            source = "root"
+
+        proposals.append({
+            "session": s,
+            "current": current,
+            "proposed": proposed,
+            "source": source,
+        })
+    return proposals
+
+
+def apply_rename_proposals(sessions, accepted_renames):
+    """Apply {session_id -> new_name} updates to sessions and save with a backup.
+
+    Returns (updated_count, backup_path)."""
+    if not accepted_renames:
+        return (0, None)
+
+    # Backup current sessions.json
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = SESSIONS_FILE.with_suffix(f".json.pre-rename-{timestamp}")
+    if SESSIONS_FILE.exists():
+        shutil.copy2(SESSIONS_FILE, backup_path)
+
+    updated = 0
+    for s in sessions:
+        sid = s.get("session_id", "")
+        new_name = accepted_renames.get(sid)
+        if not new_name:
+            continue
+        if s.get("name") != new_name:
+            s["name"] = new_name
+            updated += 1
+
+    save_sessions(sessions)
+    return (updated, backup_path)
+
+
 def restore_session_backup(backup_path, session_id, project_dir_name):
     """Copy a backup file back to ~/.claude/projects/<project>/<session_id>.jsonl.
     Also ensures a companion session folder exists (Claude Code requires both)."""
@@ -250,8 +353,16 @@ def discover_sessions():
                                     if isinstance(c, dict) and c.get("type") == "text":
                                         content = c.get("text", "")
                                         break
-                            if isinstance(content, str) and content.strip() and not content.startswith("<"):
-                                preview = content.strip().replace("\n", " ")[:60]
+                            if isinstance(content, str):
+                                stripped = content.strip()
+                                # Skip Claude Code's auto-generated continuation marker, system tags,
+                                # tool-result pings, and IDE selections — none are real user prompts.
+                                if (stripped
+                                        and not stripped.startswith("<")
+                                        and not stripped.lower().startswith("this session is being continued")
+                                        and not stripped.lower().startswith("caveat: the messages below")
+                                        and not stripped.lower().startswith("[request interrupted")):
+                                    preview = stripped.replace("\n", " ")[:60]
                         if real_cwd and preview and forked_from is not None and logical_parent is not None:
                             break
             except Exception:
@@ -547,6 +658,7 @@ class SessionManagerApp:
             ("New", self.add_session),
             ("Edit", self.edit_session),
             ("Remove", self.remove_session),
+            ("Auto-rename", self.auto_rename_sessions),
         ]:
             ToolbarButton(toolbar, text=text, command=cmd).pack(side="left", padx=1)
 
@@ -1175,6 +1287,39 @@ class SessionManagerApp:
             self.detail_label.config(text="  Select a session to view details",
                                       fg=C["text_dim"])
 
+    def auto_rename_sessions(self):
+        """Compute proposed names from each session's first prompt + parent and
+        show a preview dialog the user can edit before applying."""
+        if not self.sessions:
+            messagebox.showinfo("Auto-rename", "No registered sessions.")
+            return
+        self.status.flash("Reading first prompts from each session...", C["accent_orange"])
+        self.root.update()
+        # Refresh discovery so we have current first-prompts and forked_from info
+        if not self._discovered_cache:
+            self._discovered_cache = discover_sessions()
+        proposals = compute_rename_proposals(self.sessions, self._discovered_cache)
+
+        # Skip rows where current == proposed already (no change)
+        changing = [p for p in proposals if p["proposed"] and p["proposed"] != p["current"]]
+        if not changing:
+            messagebox.showinfo("Auto-rename",
+                                "All session names already match their first prompts. Nothing to change.")
+            return
+
+        AutoRenameDialog(self.root, self, proposals, on_apply=self._on_rename_applied)
+
+    def _on_rename_applied(self, accepted_renames):
+        """Called by AutoRenameDialog when the user clicks Apply."""
+        updated, backup = apply_rename_proposals(self.sessions, accepted_renames)
+        self._populate_list()
+        self._update_status_segments()
+        if updated:
+            msg = f"Renamed {updated} sessions  (backup: {backup.name if backup else 'none'})"
+            self.status.flash(msg, C["accent_green"])
+        else:
+            self.status.flash("No sessions were renamed.")
+
     def scan_sessions(self):
         self.status.flash("Scanning Claude storage...", C["accent_orange"])
         self.root.update()
@@ -1702,6 +1847,189 @@ class RestoreDialog(tk.Toplevel):
             self.destroy()
         except Exception as e:
             messagebox.showerror("Restore Failed", str(e))
+
+
+class AutoRenameDialog(tk.Toplevel):
+    """Preview proposed session names side-by-side and let the user edit each
+    line before applying. Empty proposed name = skip that row."""
+
+    SOURCE_COLORS = {
+        "root":    C["accent_green"],
+        "branch":  C["accent_orange"],
+        "missing": C["text_dim"],
+    }
+    SOURCE_LABELS = {
+        "root":    "ROOT",
+        "branch":  "BRANCH",
+        "missing": "MISSING",
+    }
+
+    def __init__(self, parent, app, proposals, on_apply):
+        super().__init__(parent)
+        self.app = app
+        self.proposals = proposals
+        self.on_apply = on_apply
+        self.entry_vars = {}  # session_id -> tk.StringVar
+        self.row_checked = {}  # session_id -> tk.BooleanVar
+
+        W, H = 1100, 680
+        self.title("Auto-rename Sessions")
+        self.geometry(f"{W}x{H}")
+        self.minsize(900, 540)
+        self.configure(bg=C["bg"])
+        self.transient(parent)
+        self.grab_set()
+        self.update_idletasks()
+        x = parent.winfo_x() + (parent.winfo_width() - W) // 2
+        y = parent.winfo_y() + (parent.winfo_height() - H) // 2
+        self.geometry(f"+{x}+{y}")
+
+        # Header
+        header = tk.Frame(self, bg=C["bg_toolbar"], height=46)
+        header.pack(fill="x")
+        header.pack_propagate(False)
+        tk.Label(header, text="  Auto-rename Sessions",
+                 bg=C["bg_toolbar"], fg=C["text_bright"],
+                 font=("Segoe UI", 15, "bold")).pack(side="left", fill="y")
+        tk.Frame(self, bg=C["border"], height=1).pack(fill="x")
+
+        # Counts summary
+        n_change   = sum(1 for p in proposals if p["proposed"] and p["proposed"] != p["current"])
+        n_same     = sum(1 for p in proposals if p["proposed"] and p["proposed"] == p["current"])
+        n_skipped  = sum(1 for p in proposals if not p["proposed"])
+        summary = tk.Frame(self, bg=C["bg"])
+        summary.pack(fill="x", padx=18, pady=(10, 6))
+        tk.Label(summary,
+                 text=f"{n_change} will change   ·   {n_same} already match   ·   {n_skipped} skipped (missing .jsonl)",
+                 bg=C["bg"], fg=C["text_dim"], font=("Segoe UI", 12)).pack(anchor="w")
+        tk.Label(summary,
+                 text="Uncheck rows you want to keep. Edit the proposed name inline if you want a different label.",
+                 bg=C["bg"], fg=C["text_dim"], font=("Segoe UI", 11)).pack(anchor="w", pady=(2, 0))
+
+        # Scrollable list of rows
+        list_outer = tk.Frame(self, bg=C["bg"])
+        list_outer.pack(fill="both", expand=True, padx=18, pady=4)
+
+        self.canvas = tk.Canvas(list_outer, bg=C["bg"], highlightthickness=0)
+        scrollbar = ttk.Scrollbar(list_outer, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=scrollbar.set)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        self.rows_frame = tk.Frame(self.canvas, bg=C["bg"])
+        self.canvas_window = self.canvas.create_window((0, 0), window=self.rows_frame, anchor="nw")
+
+        def _on_frame_configure(event):
+            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        def _on_canvas_configure(event):
+            self.canvas.itemconfig(self.canvas_window, width=event.width)
+        def _on_mousewheel(event):
+            self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        self.rows_frame.bind("<Configure>", _on_frame_configure)
+        self.canvas.bind("<Configure>", _on_canvas_configure)
+        self.canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+        # Column headers
+        hdr = tk.Frame(self.rows_frame, bg=C["bg_lighter"])
+        hdr.pack(fill="x", pady=(0, 2))
+        tk.Label(hdr, text="", bg=C["bg_lighter"], width=3).pack(side="left", padx=(6, 0))
+        tk.Label(hdr, text="Current name", bg=C["bg_lighter"], fg=C["text_dim"],
+                 font=("Segoe UI", 11, "bold"), width=32, anchor="w").pack(side="left", padx=4, pady=4)
+        tk.Label(hdr, text="Proposed name (editable)", bg=C["bg_lighter"], fg=C["text_dim"],
+                 font=("Segoe UI", 11, "bold"), anchor="w").pack(side="left", fill="x", expand=True,
+                                                                  padx=4, pady=4)
+        tk.Label(hdr, text="Type", bg=C["bg_lighter"], fg=C["text_dim"],
+                 font=("Segoe UI", 11, "bold"), width=10, anchor="center").pack(side="right", padx=8)
+
+        # Rows — only show entries with a proposed name (skip missing-on-disk)
+        for i, p in enumerate(proposals):
+            sid = p["session"].get("session_id", "")
+            if not p["proposed"]:
+                continue
+            changed = p["proposed"] != p["current"]
+            bg = C["bg"] if i % 2 == 0 else C["bg_light"]
+            row = tk.Frame(self.rows_frame, bg=bg)
+            row.pack(fill="x")
+
+            # Checkbox — pre-checked only if the row changes something
+            chk_var = tk.BooleanVar(value=changed)
+            self.row_checked[sid] = chk_var
+            chk = tk.Checkbutton(row, variable=chk_var, bg=bg,
+                                  activebackground=bg, borderwidth=0,
+                                  highlightthickness=0, selectcolor=C["bg_input"])
+            chk.pack(side="left", padx=(6, 0))
+
+            # Current name
+            tk.Label(row, text=p["current"] or "—", bg=bg, fg=C["text"],
+                     font=("Segoe UI", 11), width=32, anchor="w").pack(side="left", padx=4, pady=4)
+
+            # Editable proposed name
+            var = tk.StringVar(value=p["proposed"])
+            self.entry_vars[sid] = var
+            entry = tk.Entry(row, textvariable=var, bg=C["bg_input"], fg=C["text_bright"],
+                             insertbackground=C["text_bright"], font=("Segoe UI", 11),
+                             relief="flat", highlightthickness=1,
+                             highlightbackground=C["border"], highlightcolor=C["accent"])
+            entry.pack(side="left", fill="x", expand=True, padx=4, pady=4, ipady=2)
+
+            # Type badge
+            badge_text = self.SOURCE_LABELS.get(p["source"], "?")
+            badge_color = self.SOURCE_COLORS.get(p["source"], C["text_dim"])
+            tk.Label(row, text=badge_text, bg=bg, fg=badge_color,
+                     font=("Segoe UI", 10, "bold"), width=10, anchor="center").pack(side="right", padx=8)
+
+        # Buttons
+        tk.Frame(self, bg=C["border"], height=1).pack(fill="x")
+        btn_bar = tk.Frame(self, bg=C["bg_lighter"], height=56)
+        btn_bar.pack(fill="x")
+        btn_bar.pack_propagate(False)
+
+        tk.Button(btn_bar, text="Cancel", bg=C["bg_toolbar"], fg=C["text"],
+                  font=("Segoe UI", 13), relief="flat", padx=16, pady=6,
+                  cursor="hand2", command=self._on_cancel).pack(side="right", padx=8, pady=10)
+
+        tk.Button(btn_bar, text="Select all", bg=C["bg_toolbar"], fg=C["text"],
+                  font=("Segoe UI", 12), relief="flat", padx=14, pady=6,
+                  cursor="hand2", command=lambda: self._toggle_all(True)
+                  ).pack(side="left", padx=(14, 4), pady=10)
+        tk.Button(btn_bar, text="Select none", bg=C["bg_toolbar"], fg=C["text"],
+                  font=("Segoe UI", 12), relief="flat", padx=14, pady=6,
+                  cursor="hand2", command=lambda: self._toggle_all(False)
+                  ).pack(side="left", padx=4, pady=10)
+
+        tk.Button(btn_bar, text="Apply Selected", bg=C["accent"], fg=C["text_white"],
+                  font=("Segoe UI", 13, "bold"), relief="flat", padx=16, pady=6,
+                  cursor="hand2", command=self._on_apply).pack(side="right", pady=10)
+
+    def _toggle_all(self, value):
+        for var in self.row_checked.values():
+            var.set(value)
+
+    def _on_cancel(self):
+        self.canvas.unbind_all("<MouseWheel>")
+        self.destroy()
+
+    def _on_apply(self):
+        accepted = {}
+        for sid, var in self.entry_vars.items():
+            if not self.row_checked.get(sid, tk.BooleanVar(value=False)).get():
+                continue
+            name = var.get().strip()
+            if name:
+                accepted[sid] = name
+        if not accepted:
+            messagebox.showinfo("Auto-rename", "No rows selected. Nothing to do.")
+            return
+        if not messagebox.askyesno(
+            "Confirm rename",
+            f"Rename {len(accepted)} sessions?\n\n"
+            f"Your current sessions.json will be backed up as\n"
+            f"sessions.json.pre-rename-<timestamp> before changes are applied."
+        ):
+            return
+        self.canvas.unbind_all("<MouseWheel>")
+        self.on_apply(accepted)
+        self.destroy()
 
 
 class RunTaskDialog(tk.Toplevel):

@@ -25,6 +25,7 @@
   - [Per-session model](#per-session-model)
   - [Cost tracking](#cost-tracking)
   - [Tree view (branches)](#tree-view-branches)
+  - [Auto-rename sessions](#auto-rename-sessions)
   - [Backup](#backup)
   - [Restore](#restore)
   - [CLI quick launch](#cli-quick-launch)
@@ -188,6 +189,26 @@ Useful for:
 - Picking any branch to launch directly — even ones you never added to `sessions.json`
 
 > Tree mode walks every `.jsonl` under `~/.claude/projects/` and reads the first ~40 records of each to extract the branch parent. On a large workspace this can take a second on the first toggle; subsequent toggles are cached.
+
+### Auto-rename sessions
+
+Toolbar **Auto-rename** button opens a preview dialog that proposes a clean name for every registered session based on:
+
+- **Root sessions** (no `forkedFrom`): the first real user prompt, truncated to ~75 chars
+- **Branched sessions**: `<parent's first prompt> » <this branch's first prompt>`
+
+Each row in the preview is a checkbox + editable text field, so you can:
+- **Uncheck** rows you want to keep as-is
+- **Edit** any proposed name inline before applying
+- Click **Select all** / **Select none** for bulk toggle
+
+When you click **Apply Selected**, your current `sessions.json` is copied to `sessions.json.pre-rename-<timestamp>` before changes are written — fully reversible by restoring the backup.
+
+**Heuristics CSM applies when extracting first prompts:**
+- Skips Claude Code's auto-generated continuation marker (`"This session is being continued from a previous conversation..."`)
+- Skips IDE-injection caveats and interruption messages
+- Skips records that start with `<` (system tags)
+- Uses the parent's **own first prompt** as the prefix, not its already-prefixed name — so you never see cascading "A » B » C » D" chains
 
 ### Backup
 
