@@ -194,6 +194,36 @@ _PROMPT_SKIP_PREFIXES = (
 )
 
 
+def format_last_used(mtime):
+    """Render a file mtime (epoch float) as a friendly 'when' string."""
+    if not mtime:
+        return ""
+    from datetime import datetime as _dt
+    try:
+        dt = _dt.fromtimestamp(mtime)
+    except Exception:
+        return ""
+    now = _dt.now()
+    delta = now - dt
+    secs = delta.total_seconds()
+    if secs < 60:
+        return "just now"
+    if secs < 3600:
+        m = int(secs // 60)
+        return f"{m} min ago"
+    if secs < 86400:
+        h = int(secs // 3600)
+        return f"{h}h ago"
+    if secs < 86400 * 7:
+        d = int(secs // 86400)
+        return f"{d}d ago"
+    if secs < 86400 * 30:
+        w = int(secs // (86400 * 7))
+        return f"{w}w ago"
+    # Older than a month: show absolute date
+    return dt.strftime("%Y-%m-%d")
+
+
 def extract_user_prompts(jsonl_path):
     """Walk a .jsonl and return a list of {idx, timestamp, text} dicts — one per
     real user prompt. Skips Claude Code's auto-generated noise (continuation
@@ -598,6 +628,8 @@ class SessionManagerApp:
         self.root.after(500, self._auto_backup_on_start)
         # Cost computation also in background once at startup
         self.root.after(800, self._compute_all_costs_async)
+        # Seed the discovered cache so the Last Used column populates without first opening Tree view
+        self.root.after(900, self._seed_discovered_async)
 
     def _configure_styles(self):
         style = ttk.Style()
@@ -814,7 +846,7 @@ class SessionManagerApp:
         tree_frame = tk.Frame(paned, bg=C["bg"])
         tree_frame.pack(side="left", fill="both", expand=True)
 
-        columns = ("name", "alias", "directory", "mode", "model", "cost", "session_id")
+        columns = ("name", "alias", "directory", "mode", "model", "cost", "last_used", "session_id")
         # show="tree headings" gives us an expandable left column for the tree view;
         # the tree column is hidden in flat mode via column width.
         self.tree = ttk.Treeview(tree_frame, columns=columns, show="tree headings",
@@ -832,15 +864,18 @@ class SessionManagerApp:
         self.tree.heading("model", text="Model", anchor="w")
         self.tree.heading("cost", text="Cost", anchor="e",
                           command=lambda: self._sort_by("_cost"))
+        self.tree.heading("last_used", text="Last Used", anchor="w",
+                          command=lambda: self._sort_by("_last_used"))
         self.tree.heading("session_id", text="Session ID", anchor="w")
 
         self.tree.column("name", width=200, minwidth=120)
         self.tree.column("alias", width=110, minwidth=70)
-        self.tree.column("directory", width=270, minwidth=140)
+        self.tree.column("directory", width=240, minwidth=140)
         self.tree.column("mode", width=60, minwidth=50, anchor="center")
         self.tree.column("model", width=100, minwidth=80)
-        self.tree.column("cost", width=80, minwidth=70, anchor="e")
-        self.tree.column("session_id", width=220, minwidth=120)
+        self.tree.column("cost", width=75, minwidth=65, anchor="e")
+        self.tree.column("last_used", width=130, minwidth=100, anchor="w")
+        self.tree.column("session_id", width=200, minwidth=120)
 
         scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=self._on_scroll)
         self.tree.configure(yscrollcommand=self._sync_scroll)
@@ -995,6 +1030,8 @@ class SessionManagerApp:
             model_short = model_label.replace("Default (Claude Code chooses)", "Default")
             cost_usd = self._cost_cache.get(sid, {}).get("usd")
             cost_str = _pricing.format_cost(cost_usd) if cost_usd is not None else "—"
+            mtime = self._mtime_for(sid)
+            last_used = format_last_used(mtime) if mtime else "—"
 
             if filter_text:
                 if (filter_text not in name.lower() and
@@ -1006,7 +1043,7 @@ class SessionManagerApp:
 
             tag = "odd" if count % 2 == 0 else "even"
             self.tree.insert("", "end",
-                             values=(name, alias, cwd, mode, model_short, cost_str, sid),
+                             values=(name, alias, cwd, mode, model_short, cost_str, last_used, sid),
                              tags=(tag,))
             count += 1
 
@@ -1069,7 +1106,7 @@ class SessionManagerApp:
             # Project header row
             proj_iid = f"proj::{proj}"
             self.tree.insert("", "end", iid=proj_iid, text=f"  📁 {proj}  ({len(children)})",
-                             values=("", "", "", "", "", "", ""), open=True, tags=("project",))
+                             values=("", "", "", "", "", "", "", ""), open=True, tags=("project",))
 
             # Sort roots by mtime desc, recurse
             def _row_label(d):
@@ -1087,7 +1124,8 @@ class SessionManagerApp:
                 model_short = model_lbl.replace("Default (Claude Code chooses)", "Default")
                 cost_usd = self._cost_cache.get(d["session_id"], {}).get("usd")
                 cost_str = _pricing.format_cost(cost_usd) if cost_usd is not None else "—"
-                return ("", alias, d.get("cwd", ""), mode_v, model_short, cost_str, d["session_id"])
+                last_used = format_last_used(d.get("mtime", 0)) if d.get("mtime") else "—"
+                return ("", alias, d.get("cwd", ""), mode_v, model_short, cost_str, last_used, d["session_id"])
 
             def _matches_filter(d):
                 if not filter_text:
@@ -1145,6 +1183,11 @@ class SessionManagerApp:
         if key == "_cost":
             self.sessions.sort(
                 key=lambda s: self._cost_cache.get(s.get("session_id", ""), {}).get("usd", 0.0),
+                reverse=self.sort_reverse,
+            )
+        elif key == "_last_used":
+            self.sessions.sort(
+                key=lambda s: self._mtime_for(s.get("session_id", "")),
                 reverse=self.sort_reverse,
             )
         else:
@@ -1611,6 +1654,36 @@ class SessionManagerApp:
                       lambda: self.status.flash("Session restored from backup", C["accent_green"]))
 
     # --- Cost ---
+    def _seed_discovered_async(self):
+        """Background-warm the discovered cache so Last Used / Tree are instant."""
+        def worker():
+            try:
+                disc = discover_sessions()
+                def apply():
+                    self._discovered_cache = disc
+                    self._populate_list()
+                self.root.after(0, apply)
+            except Exception:
+                pass
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _mtime_for(self, session_id):
+        """Return mtime of the session's .jsonl on disk, preferring discovered cache."""
+        for d in self._discovered_cache:
+            if d.get("session_id") == session_id:
+                return d.get("mtime", 0)
+        # Fall back to direct disk lookup
+        for proj_dir in PROJECTS_DIR.iterdir():
+            if not proj_dir.is_dir():
+                continue
+            candidate = proj_dir / f"{session_id}.jsonl"
+            if candidate.exists():
+                try:
+                    return candidate.stat().st_mtime
+                except Exception:
+                    return 0
+        return 0
+
     def _resolve_session_jsonl(self, session):
         """Find the .jsonl file for a session by id under ~/.claude/projects/*/."""
         sid = session.get("session_id", "")
