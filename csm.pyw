@@ -6,6 +6,7 @@ Notepad++-style professional interface for managing Claude Code sessions.
 import ctypes
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -329,38 +330,57 @@ def compute_rename_proposals(sessions, discovered):
             parent_disc = by_id.get(forked_from)
             parent_reg = registered_by_id.get(forked_from)
             parent_name = ""
-            if parent_disc and parent_disc.get("name") and not parent_disc.get("name", "").endswith("..."):
+            # Parent's own branch_label wins over its first prompt
+            if parent_disc and parent_disc.get("branch_label"):
+                parent_name = parent_disc["branch_label"]
+            elif parent_disc and parent_disc.get("name") and not parent_disc.get("name", "").endswith("..."):
                 parent_name = parent_disc["name"]
             elif parent_reg and parent_reg.get("name"):
-                # Strip any existing branch prefix so we don't compound it
                 pname = parent_reg["name"]
                 parent_name = pname.split(" » ")[0] if " » " in pname else pname
             parent_short = _clean_name(parent_name, 25)
-            prompt_short = _clean_name(first_prompt, 50) or sid[:8]
-            if parent_short:
-                proposed = f"{parent_short} » {prompt_short}"
+
+            # If THIS session was created via /branch <label>, use that label as the body
+            label = disc.get("branch_label")
+            if label:
+                body = _clean_name(label, 50)
             else:
-                proposed = prompt_short
+                body = _clean_name(first_prompt, 50) or sid[:8]
+
+            if parent_short:
+                proposed = f"{parent_short} » {body}"
+            else:
+                proposed = body
             source = "branch"
         else:
             proposed = _clean_name(first_prompt, 75) or sid[:8]
             source = "root"
+
+        # If branched via /branch <label>, propose a tidy alias too
+        proposed_alias = None
+        if disc and disc.get("branch_label"):
+            slug = re.sub(r"[^a-z0-9]+", "-", disc["branch_label"].lower()).strip("-")
+            if slug:
+                proposed_alias = slug[:32]
 
         proposals.append({
             "session": s,
             "current": current,
             "proposed": proposed,
             "source": source,
+            "proposed_alias": proposed_alias,
         })
     return proposals
 
 
-def apply_rename_proposals(sessions, accepted_renames):
-    """Apply {session_id -> new_name} updates to sessions and save with a backup.
+def apply_rename_proposals(sessions, accepted_renames, accepted_aliases=None):
+    """Apply {session_id -> new_name} (and optional {session_id -> new_alias})
+    updates to sessions and save with a backup.
 
     Returns (updated_count, backup_path)."""
-    if not accepted_renames:
+    if not accepted_renames and not accepted_aliases:
         return (0, None)
+    accepted_aliases = accepted_aliases or {}
 
     # Backup current sessions.json
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -371,11 +391,16 @@ def apply_rename_proposals(sessions, accepted_renames):
     updated = 0
     for s in sessions:
         sid = s.get("session_id", "")
+        changed = False
         new_name = accepted_renames.get(sid)
-        if not new_name:
-            continue
-        if s.get("name") != new_name:
+        if new_name and s.get("name") != new_name:
             s["name"] = new_name
+            changed = True
+        new_alias = accepted_aliases.get(sid)
+        if new_alias and s.get("alias") != new_alias:
+            s["alias"] = new_alias
+            changed = True
+        if changed:
             updated += 1
 
     save_sessions(sessions)
@@ -421,7 +446,9 @@ def discover_sessions():
             preview = ""
             real_cwd = None
             forked_from = None
+            forked_from_msg_uuid = None
             logical_parent = None
+            branch_label = None
             try:
                 with open(jsonl, "r", encoding="utf-8", errors="ignore") as f:
                     for i, line in enumerate(f):
@@ -437,8 +464,22 @@ def discover_sessions():
                             ff = rec.get("forkedFrom")
                             if isinstance(ff, dict) and ff.get("sessionId"):
                                 forked_from = ff["sessionId"]
+                                forked_from_msg_uuid = ff.get("messageUuid")
                         if logical_parent is None and rec.get("logicalParentUuid"):
                             logical_parent = rec["logicalParentUuid"]
+                        # Find the /branch <args> system record whose uuid matches our forkedFrom anchor.
+                        # That gives us the user-typed branch label ("paperclip", "story", etc.)
+                        if (branch_label is None
+                                and forked_from_msg_uuid
+                                and rec.get("uuid") == forked_from_msg_uuid
+                                and rec.get("type") == "system"
+                                and "/branch" in (rec.get("content") or "")):
+                            m = re.search(r"<command-args>(.*?)</command-args>",
+                                          rec.get("content", ""), re.S)
+                            if m:
+                                lbl = m.group(1).strip()
+                                if lbl:
+                                    branch_label = lbl
                         if not preview and rec.get("type") == "user":
                             msg = rec.get("message", {})
                             content = msg.get("content", "")
@@ -457,7 +498,9 @@ def discover_sessions():
                                         and not stripped.lower().startswith("caveat: the messages below")
                                         and not stripped.lower().startswith("[request interrupted")):
                                     preview = stripped.replace("\n", " ")[:60]
-                        if real_cwd and preview and forked_from is not None and logical_parent is not None:
+                        if (real_cwd and preview and forked_from is not None
+                                and logical_parent is not None
+                                and (branch_label is not None or forked_from is None)):
                             break
             except Exception:
                 pass
@@ -476,6 +519,7 @@ def discover_sessions():
                 "size": size,
                 "forked_from": forked_from,
                 "logical_parent": logical_parent,
+                "branch_label": branch_label,
             })
     # Most recent first
     discovered.sort(key=lambda d: d.get("mtime", 0), reverse=True)
@@ -1563,9 +1607,9 @@ class SessionManagerApp:
 
         AutoRenameDialog(self.root, self, proposals, on_apply=self._on_rename_applied)
 
-    def _on_rename_applied(self, accepted_renames):
+    def _on_rename_applied(self, accepted_renames, accepted_aliases=None):
         """Called by AutoRenameDialog when the user clicks Apply."""
-        updated, backup = apply_rename_proposals(self.sessions, accepted_renames)
+        updated, backup = apply_rename_proposals(self.sessions, accepted_renames, accepted_aliases)
         self._populate_list()
         self._update_status_segments()
         if updated:
@@ -2295,24 +2339,35 @@ class AutoRenameDialog(tk.Toplevel):
 
     def _on_apply(self):
         accepted = {}
+        alias_map = {}
+        # Build sid -> proposed_alias lookup from the original proposals list
+        proposed_alias_by_sid = {
+            p["session"].get("session_id"): p.get("proposed_alias")
+            for p in self.proposals
+        }
         for sid, var in self.entry_vars.items():
             if not self.row_checked.get(sid, tk.BooleanVar(value=False)).get():
                 continue
             name = var.get().strip()
             if name:
                 accepted[sid] = name
+                # Also accept an alias update if we have one proposed
+                if proposed_alias_by_sid.get(sid):
+                    alias_map[sid] = proposed_alias_by_sid[sid]
         if not accepted:
             messagebox.showinfo("Auto-rename", "No rows selected. Nothing to do.")
             return
         if not messagebox.askyesno(
             "Confirm rename",
-            f"Rename {len(accepted)} sessions?\n\n"
+            f"Rename {len(accepted)} sessions"
+            + (f" (and update {len(alias_map)} aliases)" if alias_map else "")
+            + "?\n\n"
             f"Your current sessions.json will be backed up as\n"
             f"sessions.json.pre-rename-<timestamp> before changes are applied."
         ):
             return
         self.canvas.unbind_all("<MouseWheel>")
-        self.on_apply(accepted)
+        self.on_apply(accepted, alias_map)
         self.destroy()
 
 
