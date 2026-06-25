@@ -446,13 +446,15 @@ def discover_sessions():
             preview = ""
             real_cwd = None
             forked_from = None
-            forked_from_msg_uuid = None
             logical_parent = None
             branch_label = None
             try:
                 with open(jsonl, "r", encoding="utf-8", errors="ignore") as f:
+                    # NOTE: scan up to ~2000 records — the /branch <label> system command
+                    # for THIS session usually appears within the first few hundred records,
+                    # not necessarily at the forkedFrom.messageUuid anchor.
                     for i, line in enumerate(f):
-                        if i > 40:
+                        if i > 2000:
                             break
                         try:
                             rec = json.loads(line)
@@ -464,16 +466,14 @@ def discover_sessions():
                             ff = rec.get("forkedFrom")
                             if isinstance(ff, dict) and ff.get("sessionId"):
                                 forked_from = ff["sessionId"]
-                                forked_from_msg_uuid = ff.get("messageUuid")
                         if logical_parent is None and rec.get("logicalParentUuid"):
                             logical_parent = rec["logicalParentUuid"]
-                        # Find the /branch <args> system record whose uuid matches our forkedFrom anchor.
-                        # That gives us the user-typed branch label ("paperclip", "story", etc.)
+                        # The FIRST /branch <label> command record in this session's own .jsonl
+                        # is the user-typed birth label ("paperclip", "story", etc.). Subsequent
+                        # /branch records in the same file create CHILD branches and are not ours.
                         if (branch_label is None
-                                and forked_from_msg_uuid
-                                and rec.get("uuid") == forked_from_msg_uuid
                                 and rec.get("type") == "system"
-                                and "/branch" in (rec.get("content") or "")):
+                                and "<command-name>/branch</command-name>" in (rec.get("content") or "")):
                             m = re.search(r"<command-args>(.*?)</command-args>",
                                           rec.get("content", ""), re.S)
                             if m:
@@ -498,9 +498,9 @@ def discover_sessions():
                                         and not stripped.lower().startswith("caveat: the messages below")
                                         and not stripped.lower().startswith("[request interrupted")):
                                     preview = stripped.replace("\n", " ")[:60]
+                        # Early exit: have everything we need
                         if (real_cwd and preview and forked_from is not None
-                                and logical_parent is not None
-                                and (branch_label is not None or forked_from is None)):
+                                and logical_parent is not None and branch_label is not None):
                             break
             except Exception:
                 pass
