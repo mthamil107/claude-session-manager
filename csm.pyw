@@ -39,13 +39,41 @@ MAX_BACKUPS_PER_SESSION = 10
 # (Display label, model id passed to `claude --model`). "" = no flag (use Claude Code default).
 MODEL_CHOICES = [
     ("Default (Claude Code chooses)", ""),
+    ("Sonnet 5",    "claude-sonnet-5"),
+    ("Opus 4.8",    "claude-opus-4-8"),
     ("Opus 4.7",    "claude-opus-4-7"),
     ("Opus 4.6",    "claude-opus-4-6"),
     ("Sonnet 4.6",  "claude-sonnet-4-6"),
     ("Haiku 4.5",   "claude-haiku-4-5-20251001"),
+    ("Fable 5",     "claude-fable-5"),
 ]
 MODEL_LABEL_BY_ID = {mid: label for label, mid in MODEL_CHOICES}
 MODEL_ID_BY_LABEL = {label: mid for label, mid in MODEL_CHOICES}
+
+
+def get_all_model_choices():
+    """Return MODEL_CHOICES plus any Anthropic model in synced pricing.json we don't already know.
+    Called by the Edit dialog so the dropdown auto-extends after Sync Costs."""
+    choices = list(MODEL_CHOICES)
+    known_ids = {mid for _, mid in choices}
+    try:
+        p = _pricing.load_pricing()
+        # Sort so newest / most-relevant entries appear first: opus > sonnet > haiku > others
+        extras = []
+        for name in sorted(p.keys()):
+            lname = name.lower()
+            if name in known_ids:
+                continue
+            # Only offer clean, non-vendor-prefixed Anthropic model ids
+            if "claude" not in lname:
+                continue
+            if any(bad in lname for bad in ("bedrock", "vertex", "azure", "/", "@", "us.", "eu.")):
+                continue
+            extras.append((f"[synced] {name}", name))
+        choices.extend(extras[:20])  # Cap so dropdown doesn't explode
+    except Exception:
+        pass
+    return choices
 
 # --- Notepad++ Dark Theme Palette ---
 C = {
@@ -193,6 +221,203 @@ _PROMPT_SKIP_PREFIXES = (
     "caveat: the messages below",
     "[request interrupted",
 )
+
+
+# --- Skills discovery ---
+
+def _parse_skill_frontmatter(md_path):
+    """Extract YAML-ish frontmatter from a SKILL.md. Returns dict of key->value strings."""
+    result = {}
+    try:
+        with open(md_path, "r", encoding="utf-8", errors="ignore") as f:
+            text = f.read(8192)
+    except Exception:
+        return result
+    if not text.startswith("---"):
+        return result
+    end = text.find("\n---", 4)
+    if end == -1:
+        return result
+    front = text[4:end]
+    for line in front.splitlines():
+        if ":" not in line:
+            continue
+        k, _, v = line.partition(":")
+        k = k.strip()
+        v = v.strip().strip("\"'")
+        if k:
+            result[k] = v
+    return result
+
+
+CLAUDE_SETTINGS_FILE = CLAUDE_HOME / "settings.json"
+BACKUP_HOOK_SCRIPT   = SCRIPT_DIR / "csm_backup_hook.py"
+BACKUP_HOOK_MARKER   = "csm-backup-hook"  # embedded so we can find & remove our entry
+
+
+def _load_claude_settings():
+    if CLAUDE_SETTINGS_FILE.exists():
+        try:
+            return json.loads(CLAUDE_SETTINGS_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_claude_settings(data):
+    CLAUDE_HOME.mkdir(parents=True, exist_ok=True)
+    # Back up before writing
+    if CLAUDE_SETTINGS_FILE.exists():
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        bkp = CLAUDE_SETTINGS_FILE.with_suffix(f".json.csm-backup-{ts}")
+        shutil.copy2(CLAUDE_SETTINGS_FILE, bkp)
+    CLAUDE_SETTINGS_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False),
+                                     encoding="utf-8")
+
+
+def is_backup_hook_installed():
+    """True if a SessionEnd hook pointing at csm_backup_hook.py exists."""
+    settings = _load_claude_settings()
+    hooks = settings.get("hooks", {})
+    for entry in hooks.get("SessionEnd", []) or []:
+        if isinstance(entry, dict):
+            for h in entry.get("hooks", []) or []:
+                if isinstance(h, dict) and BACKUP_HOOK_MARKER in json.dumps(h):
+                    return True
+    return False
+
+
+def install_backup_hook():
+    """Add or refresh the SessionEnd hook entry. Returns backup path if we made one."""
+    settings = _load_claude_settings()
+    hooks = settings.setdefault("hooks", {})
+    session_end = hooks.setdefault("SessionEnd", [])
+
+    # Remove any existing csm-backup entries first (avoid duplicates)
+    for entry in list(session_end):
+        if isinstance(entry, dict):
+            entry_hooks = entry.get("hooks", []) or []
+            filtered = [h for h in entry_hooks
+                        if not (isinstance(h, dict) and BACKUP_HOOK_MARKER in json.dumps(h))]
+            if len(filtered) != len(entry_hooks):
+                entry["hooks"] = filtered
+                if not filtered:
+                    session_end.remove(entry)
+
+    # Build the new hook entry. Marker lives in a comment field so we can find it later.
+    py_exec = sys.executable.replace("\\", "\\\\")
+    script_path = str(BACKUP_HOOK_SCRIPT).replace("\\", "\\\\")
+    new_hook = {
+        "type": "command",
+        "command": f'"{py_exec}" "{script_path}"',
+        "description": f"{BACKUP_HOOK_MARKER}: back up transcript to CSM's session_backups/",
+    }
+    session_end.append({"matcher": "", "hooks": [new_hook]})
+    _save_claude_settings(settings)
+
+
+def uninstall_backup_hook():
+    """Remove any csm-backup hook entries from ~/.claude/settings.json."""
+    settings = _load_claude_settings()
+    hooks = settings.get("hooks", {})
+    session_end = hooks.get("SessionEnd", []) or []
+    if not session_end:
+        return
+    for entry in list(session_end):
+        if isinstance(entry, dict):
+            entry_hooks = entry.get("hooks", []) or []
+            filtered = [h for h in entry_hooks
+                        if not (isinstance(h, dict) and BACKUP_HOOK_MARKER in json.dumps(h))]
+            if len(filtered) != len(entry_hooks):
+                entry["hooks"] = filtered
+                if not filtered:
+                    session_end.remove(entry)
+    _save_claude_settings(settings)
+
+
+def discover_skills(project_cwds=None):
+    """Find all Claude Code skills across personal (~/.claude/skills/) and any
+    given project cwds (.claude/skills/). Returns list of dicts."""
+    project_cwds = project_cwds or []
+    seen_dirs = set()
+    skills = []
+
+    # Personal skills
+    personal_root = CLAUDE_HOME / "skills"
+    if personal_root.is_dir():
+        for skill_dir in personal_root.iterdir():
+            if not skill_dir.is_dir() or skill_dir.name.startswith("."):
+                continue
+            skill_md = skill_dir / "SKILL.md"
+            if skill_md.exists():
+                fm = _parse_skill_frontmatter(skill_md)
+                skills.append({
+                    "name": fm.get("name") or skill_dir.name,
+                    "description": fm.get("description", ""),
+                    "when_to_use": fm.get("when_to_use", ""),
+                    "user_invocable": (fm.get("user-invocable", "").lower() in ("true", "1", "yes")
+                                        or fm.get("user_invocable", "").lower() in ("true", "1", "yes")),
+                    "source": "personal",
+                    "path": str(skill_md),
+                    "scope": "~/.claude/skills",
+                })
+
+    # Project skills
+    for cwd in project_cwds:
+        try:
+            p = Path(cwd) / ".claude" / "skills"
+        except Exception:
+            continue
+        if not p.is_dir() or str(p) in seen_dirs:
+            continue
+        seen_dirs.add(str(p))
+        for skill_dir in p.iterdir():
+            if not skill_dir.is_dir() or skill_dir.name.startswith("."):
+                continue
+            skill_md = skill_dir / "SKILL.md"
+            if skill_md.exists():
+                fm = _parse_skill_frontmatter(skill_md)
+                skills.append({
+                    "name": fm.get("name") or skill_dir.name,
+                    "description": fm.get("description", ""),
+                    "when_to_use": fm.get("when_to_use", ""),
+                    "user_invocable": (fm.get("user-invocable", "").lower() in ("true", "1", "yes")
+                                        or fm.get("user_invocable", "").lower() in ("true", "1", "yes")),
+                    "source": "project",
+                    "path": str(skill_md),
+                    "scope": cwd,
+                })
+
+    # Plugin skills (installed as plugins)
+    plugins_root = CLAUDE_HOME / "plugins"
+    if plugins_root.is_dir():
+        for plugin_dir in plugins_root.iterdir():
+            if not plugin_dir.is_dir() or plugin_dir.name.startswith("."):
+                continue
+            skills_sub = plugin_dir / "skills"
+            if not skills_sub.is_dir():
+                continue
+            for skill_dir in skills_sub.iterdir():
+                if not skill_dir.is_dir() or skill_dir.name.startswith("."):
+                    continue
+                skill_md = skill_dir / "SKILL.md"
+                if skill_md.exists():
+                    fm = _parse_skill_frontmatter(skill_md)
+                    skills.append({
+                        "name": fm.get("name") or skill_dir.name,
+                        "description": fm.get("description", ""),
+                        "when_to_use": fm.get("when_to_use", ""),
+                        "user_invocable": (fm.get("user-invocable", "").lower() in ("true", "1", "yes")
+                                            or fm.get("user_invocable", "").lower() in ("true", "1", "yes")),
+                        "source": "plugin",
+                        "path": str(skill_md),
+                        "scope": plugin_dir.name,
+                    })
+
+    # Sort: personal first, then plugins, then project
+    order = {"personal": 0, "plugin": 1, "project": 2}
+    skills.sort(key=lambda s: (order.get(s["source"], 99), s["name"].lower()))
+    return skills
 
 
 def format_last_used(mtime):
@@ -847,7 +1072,7 @@ class SessionManagerApp:
         self.tab_bar.pack(fill="x")
 
         self.tab_buttons = {}
-        for key, label in [("sessions", "Sessions"), ("settings", "Settings")]:
+        for key, label in [("sessions", "Sessions"), ("skills", "Skills"), ("settings", "Settings")]:
             tb = TabButton(self.tab_bar, text=f"  {label}  ",
                            active=(key == "sessions"),
                            command=lambda k=key: self._switch_tab(k))
@@ -865,13 +1090,19 @@ class SessionManagerApp:
         for key, btn in self.tab_buttons.items():
             btn.set_active(key == tab_key)
 
-        # Show/hide frames
+        # Hide all frames first
+        self.main_frame.pack_forget()
+        self.settings_frame.pack_forget()
+        if hasattr(self, "skills_frame"):
+            self.skills_frame.pack_forget()
+
         if tab_key == "sessions":
-            self.settings_frame.pack_forget()
             self.main_frame.pack(fill="both", expand=True)
         elif tab_key == "settings":
-            self.main_frame.pack_forget()
             self.settings_frame.pack(fill="both", expand=True)
+        elif tab_key == "skills":
+            self.skills_frame.pack(fill="both", expand=True)
+            self._refresh_skills()
 
     # --- Main Content ---
     def _build_main_area(self):
@@ -954,6 +1185,174 @@ class SessionManagerApp:
         self.settings_frame = tk.Frame(self.content_area, bg=C["bg"])
         self._build_settings_tab()
 
+        # --- Skills Tab ---
+        self.skills_frame = tk.Frame(self.content_area, bg=C["bg"])
+        self._build_skills_tab()
+
+    def _refresh_hook_status(self):
+        if is_backup_hook_installed():
+            self._hook_status_label.config(text="Status: INSTALLED", fg=C["accent_green"])
+        else:
+            self._hook_status_label.config(text="Status: not installed", fg=C["text_dim"])
+
+    def _install_backup_hook(self):
+        try:
+            install_backup_hook()
+            self._refresh_hook_status()
+            self.status.flash("SessionEnd backup hook installed", C["accent_green"])
+            messagebox.showinfo(
+                "Hook installed",
+                "SessionEnd hook installed in ~/.claude/settings.json\n\n"
+                "Every time you exit a Claude Code session (interactive or -p), "
+                "its transcript will be backed up incrementally.\n\n"
+                "Auto-backup on CSM startup remains active as a safety net."
+            )
+        except Exception as e:
+            messagebox.showerror("Install failed", str(e))
+
+    def _uninstall_backup_hook(self):
+        if not messagebox.askyesno(
+            "Uninstall hook",
+            "Remove the CSM SessionEnd hook from ~/.claude/settings.json?\n\n"
+            "Startup auto-backup will still run."
+        ):
+            return
+        try:
+            uninstall_backup_hook()
+            self._refresh_hook_status()
+            self.status.flash("SessionEnd hook removed")
+        except Exception as e:
+            messagebox.showerror("Uninstall failed", str(e))
+
+    def _build_skills_tab(self):
+        """Skills tab: read-only view of ~/.claude/skills/, project .claude/skills/,
+        and installed plugin skills. Refreshes on tab activation."""
+        pad = tk.Frame(self.skills_frame, bg=C["bg"])
+        pad.pack(fill="both", expand=True, padx=14, pady=10)
+
+        # Header row: title + refresh + counts
+        head = tk.Frame(pad, bg=C["bg"])
+        head.pack(fill="x", pady=(0, 8))
+        tk.Label(head, text="Claude Code Skills",
+                 bg=C["bg"], fg=C["text_bright"], font=("Segoe UI", 16, "bold")
+                 ).pack(side="left")
+        self.skills_count_label = tk.Label(head, text="",
+                                            bg=C["bg"], fg=C["text_dim"], font=("Segoe UI", 12))
+        self.skills_count_label.pack(side="left", padx=(12, 0))
+        tk.Button(head, text="Refresh", bg=C["bg_toolbar"], fg=C["text"],
+                  font=("Segoe UI", 12), relief="flat", padx=14, pady=4,
+                  cursor="hand2", command=self._refresh_skills).pack(side="right")
+
+        tk.Label(pad, text="Personal (~/.claude/skills/), installed plugins, "
+                            "and per-project (.claude/skills/) skills across all "
+                            "registered projects. Read-only.",
+                 bg=C["bg"], fg=C["text_dim"], font=("Segoe UI", 11),
+                 justify="left", anchor="w").pack(fill="x", pady=(0, 8))
+
+        # Split: list on top, detail on bottom
+        paned = tk.PanedWindow(pad, orient="vertical", bg=C["border"], sashwidth=4, bd=0, relief="flat")
+        paned.pack(fill="both", expand=True)
+
+        list_frame = tk.Frame(paned, bg=C["bg"])
+        paned.add(list_frame, minsize=200, height=380)
+
+        cols = ("source", "name", "invocable", "description", "scope")
+        self.skills_tree = ttk.Treeview(list_frame, columns=cols, show="headings", selectmode="browse")
+        self.skills_tree.heading("source", text="Source", anchor="w")
+        self.skills_tree.heading("name", text="Name", anchor="w")
+        self.skills_tree.heading("invocable", text="User-Invocable", anchor="center")
+        self.skills_tree.heading("description", text="Description", anchor="w")
+        self.skills_tree.heading("scope", text="Scope", anchor="w")
+        self.skills_tree.column("source", width=90, anchor="w", stretch=False)
+        self.skills_tree.column("name", width=180, anchor="w", stretch=False)
+        self.skills_tree.column("invocable", width=110, anchor="center", stretch=False)
+        self.skills_tree.column("description", width=460, anchor="w", stretch=True)
+        self.skills_tree.column("scope", width=200, anchor="w", stretch=False)
+        self.skills_tree.tag_configure("personal", background=C["bg"])
+        self.skills_tree.tag_configure("project",  background=C["bg_light"])
+        self.skills_tree.tag_configure("plugin",   background=C["bg_lighter"])
+        sb = ttk.Scrollbar(list_frame, orient="vertical", command=self.skills_tree.yview)
+        self.skills_tree.configure(yscrollcommand=sb.set)
+        self.skills_tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.skills_tree.bind("<<TreeviewSelect>>", lambda e: self._on_skill_select())
+
+        # Detail
+        detail = tk.Frame(paned, bg=C["bg"])
+        paned.add(detail, minsize=140, height=200)
+        tk.Label(detail, text="Details of selected skill:",
+                 bg=C["bg"], fg=C["text_dim"], font=("Segoe UI", 11),
+                 anchor="w").pack(fill="x", padx=4, pady=(6, 4))
+        self.skill_detail = tk.Text(detail, bg=C["bg_input"], fg=C["text_bright"],
+                                     insertbackground=C["text_bright"], font=("Consolas", 12),
+                                     relief="flat", highlightthickness=1,
+                                     highlightbackground=C["border"], wrap="word",
+                                     padx=10, pady=8, state="disabled")
+        sb2 = ttk.Scrollbar(detail, orient="vertical", command=self.skill_detail.yview)
+        self.skill_detail.configure(yscrollcommand=sb2.set)
+        self.skill_detail.pack(side="left", fill="both", expand=True)
+        sb2.pack(side="right", fill="y")
+
+        self._skills_data = []  # populated on refresh
+
+    def _refresh_skills(self):
+        # Deduplicate project cwds from registered sessions
+        cwds = sorted({s.get("cwd", "") for s in self.sessions if s.get("cwd")})
+        self._skills_data = discover_skills(cwds)
+        self.skills_tree.delete(*self.skills_tree.get_children())
+        for i, sk in enumerate(self._skills_data):
+            invocable = "yes" if sk["user_invocable"] else "—"
+            desc = " ".join(sk["description"].split())
+            if len(desc) > 300:
+                desc = desc[:300] + "..."
+            scope = sk["scope"]
+            # Trim overly long paths for the column
+            if len(scope) > 40:
+                scope = "..." + scope[-37:]
+            self.skills_tree.insert("", "end", iid=str(i),
+                                     values=(sk["source"].upper(), sk["name"], invocable, desc, scope),
+                                     tags=(sk["source"],))
+        # Counts
+        by_src = {"personal": 0, "project": 0, "plugin": 0}
+        for sk in self._skills_data:
+            by_src[sk["source"]] = by_src.get(sk["source"], 0) + 1
+        self.skills_count_label.config(
+            text=f"{len(self._skills_data)} skills   ·   personal: {by_src['personal']}  ·  "
+                 f"plugin: {by_src['plugin']}  ·  project: {by_src['project']}"
+        )
+        if self._skills_data:
+            self.skills_tree.selection_set("0")
+            self._on_skill_select()
+
+    def _on_skill_select(self):
+        sel = self.skills_tree.selection()
+        if not sel:
+            return
+        try:
+            idx = int(sel[0])
+        except Exception:
+            return
+        if idx >= len(self._skills_data):
+            return
+        sk = self._skills_data[idx]
+        try:
+            with open(sk["path"], "r", encoding="utf-8", errors="ignore") as f:
+                body = f.read(12000)
+        except Exception as e:
+            body = f"(could not read file: {e})"
+        self.skill_detail.config(state="normal")
+        self.skill_detail.delete("1.0", "end")
+        self.skill_detail.insert("1.0",
+            f"Name:            {sk['name']}\n"
+            f"Source:          {sk['source']}\n"
+            f"Scope:           {sk['scope']}\n"
+            f"Path:            {sk['path']}\n"
+            f"User-invocable:  {'yes' if sk['user_invocable'] else 'no'}\n"
+            f"Description:     {sk['description']}\n"
+            f"When to use:     {sk['when_to_use']}\n"
+            f"\n----- SKILL.md -----\n\n{body}")
+        self.skill_detail.config(state="disabled")
+
     def _build_settings_tab(self):
         pad = tk.Frame(self.settings_frame, bg=C["bg"])
         pad.pack(fill="both", expand=True, padx=40, pady=30)
@@ -976,6 +1375,29 @@ class SessionManagerApp:
                 row = tk.Frame(pad, bg=C["bg"])
                 row.pack(fill="x", pady=3)
                 ttk.Checkbutton(row, text=label, variable=var).pack(side="left")
+
+        # Backup hook
+        tk.Label(pad, text="Backup", bg=C["bg"], fg=C["text"],
+                 font=("Segoe UI", 14, "bold")).pack(anchor="w", pady=(24, 8))
+        tk.Frame(pad, bg=C["border"], height=1).pack(fill="x", pady=(0, 8))
+        tk.Label(pad,
+                 text=("Auto-backup runs on every CSM startup. "
+                       "Install a SessionEnd hook to also back up each conversation "
+                       "the instant Claude Code exits it — event-driven, no polling."),
+                 bg=C["bg"], fg=C["text_dim"], font=("Segoe UI", 11),
+                 justify="left", wraplength=880, anchor="w").pack(fill="x", pady=(0, 6))
+        hook_row = tk.Frame(pad, bg=C["bg"])
+        hook_row.pack(fill="x", pady=3)
+        self._hook_status_label = tk.Label(hook_row, text="", bg=C["bg"],
+                                            font=("Segoe UI", 12), anchor="w")
+        self._hook_status_label.pack(side="left", padx=(0, 12))
+        tk.Button(hook_row, text="Install hook", bg=C["accent"], fg=C["text_white"],
+                  font=("Segoe UI", 12, "bold"), relief="flat", padx=14, pady=4,
+                  cursor="hand2", command=self._install_backup_hook).pack(side="left", padx=(0, 4))
+        tk.Button(hook_row, text="Uninstall", bg=C["bg_toolbar"], fg=C["text"],
+                  font=("Segoe UI", 12), relief="flat", padx=14, pady=4,
+                  cursor="hand2", command=self._uninstall_backup_hook).pack(side="left")
+        self._refresh_hook_status()
 
         # Paths info
         tk.Label(pad, text="Paths", bg=C["bg"], fg=C["text"],
@@ -1040,7 +1462,8 @@ class SessionManagerApp:
         self.root.bind("<F2>", lambda e: self.edit_session())
         self.root.bind("<F5>", lambda e: self._reload())
         self.root.bind("<Key-1>", lambda e: self._switch_tab("sessions") if not self._is_entry_focused() else None)
-        self.root.bind("<Key-2>", lambda e: self._switch_tab("settings") if not self._is_entry_focused() else None)
+        self.root.bind("<Key-2>", lambda e: self._switch_tab("skills")   if not self._is_entry_focused() else None)
+        self.root.bind("<Key-3>", lambda e: self._switch_tab("settings") if not self._is_entry_focused() else None)
 
     def _is_entry_focused(self):
         focused = self.root.focus_get()
@@ -1910,11 +2333,15 @@ class SessionDialog(tk.Toplevel):
         tk.Label(form, text="Model:", bg=C["bg"], fg=C["text"],
                  font=("Segoe UI", 13)).grid(row=model_row, column=0, sticky="w",
                                               pady=(14, 0), columnspan=2)
+        all_choices = get_all_model_choices()
+        label_by_id_ext = {mid: lbl for lbl, mid in all_choices}
         current_model_id = (session.get("model", "") if session else "")
-        current_label = MODEL_LABEL_BY_ID.get(current_model_id, MODEL_CHOICES[0][0])
+        current_label = label_by_id_ext.get(current_model_id,
+                                            f"[synced] {current_model_id}" if current_model_id else all_choices[0][0])
         self.model_var = tk.StringVar(value=current_label)
+        self._model_id_by_label = {lbl: mid for lbl, mid in all_choices}
         model_box = ttk.Combobox(form, textvariable=self.model_var,
-                                 values=[lbl for lbl, _ in MODEL_CHOICES],
+                                 values=[lbl for lbl, _ in all_choices],
                                  state="readonly", font=("Segoe UI", 13))
         model_box.grid(row=model_row + 1, column=0, sticky="ew", ipady=4, columnspan=2)
 
@@ -1961,7 +2388,7 @@ class SessionDialog(tk.Toplevel):
             "session_id": session_id,
             "cwd": self.entries["cwd"].get().strip() or ".",
             "skip_permissions": self.skip_var.get(),
-            "model": MODEL_ID_BY_LABEL.get(self.model_var.get(), ""),
+            "model": self._model_id_by_label.get(self.model_var.get(), ""),
         }
         self.destroy()
 

@@ -48,7 +48,9 @@
 - **Automatic backups** of every conversation `.jsonl` file on app startup
 - **Versioned snapshots** — keeps the last 10 backups per session, auto-prunes older ones
 - **One-click restore** of any historical backup, with a `.pre-restore-*` safety copy
-- **Per-session model selector** — pin Opus 4.7, Opus 4.6, Sonnet 4.6, Haiku 4.5, or leave it on Default
+- **Per-session model selector** — pin Sonnet 5, Opus 4.8/4.7/4.6, Sonnet 4.6, Haiku 4.5, Fable 5, or leave it on Default. Dropdown auto-extends with any Anthropic model in your synced `pricing.json`, so new Claude releases show up automatically.
+- **Skills panel** — read-only view of every Claude Code skill on your machine (personal `~/.claude/skills/`, plugin-installed, and per-project `.claude/skills/`). Shows name, description, when-to-use, user-invocable flag, and full `SKILL.md` body.
+- **SessionEnd hook backup** — install a one-shot Claude Code hook that backs up each conversation the instant Claude exits it. Event-driven, incremental (fingerprint-based), no polling. Auto-backup on CSM startup stays as a safety net.
 - **Per-session cost tracking** with **Sync Costs** — pulls live pricing from [LiteLLM's price catalogue](https://github.com/BerriAI/litellm) (438+ models, updated weekly) and computes total USD per conversation
 - **Tree view** (`View: Flat` / `View: Tree` toggle) — groups every `.jsonl` on disk by project folder, then shows `/branch`-spawned children indented under their parent session
 - **Cross-session task delegation** (`Run Task` button + `csm-task` CLI) — fire a one-shot job into another project's Claude without leaving your current session, optionally with context from the calling session
